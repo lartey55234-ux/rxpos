@@ -251,3 +251,98 @@ export function createSale(actor: Actor, input: SaleInput): SaleResult {
     return { saleId, subtotalPesewas: subtotal, discountPesewas: discount, totalPesewas: total, changePesewas: change, items, controlledEntries };
   });
 }
+
+export type ReceiptLine = {
+  name: string;
+  strength: string | null;
+  form: string | null;
+  quantity: number;
+  unitPricePesewas: number;
+  lineTotalPesewas: number;
+  batchNumber: string;
+};
+
+export type Receipt = {
+  saleId: string;
+  at: string;
+  branch: string;
+  servedBy: string;
+  paymentMethod: string;
+  subtotalPesewas: number;
+  discountPesewas: number;
+  totalPesewas: number;
+  amountTenderedPesewas: number;
+  changePesewas: number;
+  lines: ReceiptLine[];
+  controlled: { name: string; quantity: number; batchNumber: string; recipient: string | null }[];
+  prescriptionNumber: string | null;
+};
+
+/** Everything a printed receipt needs, read back from what was actually recorded. */
+export function getReceipt(actor: Actor, saleId: string): Receipt {
+  const sale = actor.scope.get<{
+    sale_id: string;
+    sale_date: string;
+    branch_id: string;
+    user_id: string;
+    payment_method: string;
+    subtotal_pesewas: number;
+    discount_pesewas: number;
+    total_pesewas: number;
+    amount_tendered_pesewas: number;
+    change_pesewas: number;
+    prescription_id: string | null;
+  }>(
+    "SELECT sale_id, sale_date, branch_id, user_id, payment_method, subtotal_pesewas, discount_pesewas, total_pesewas, amount_tendered_pesewas, change_pesewas, prescription_id FROM sales WHERE tenant_id = {{tenant}} AND sale_id = ?",
+    saleId,
+  );
+  if (!sale) throw new SaleError(`Unknown sale ${saleId}`);
+
+  const branch = actor.scope.get<{ name: string }>(
+    "SELECT name FROM branches WHERE tenant_id = {{tenant}} AND branch_id = ?",
+    sale.branch_id,
+  );
+  const staff = actor.scope.get<{ name: string }>(
+    "SELECT name FROM users WHERE tenant_id = {{tenant}} AND user_id = ?",
+    sale.user_id,
+  );
+  const lines = actor.scope.all<ReceiptLine>(
+    `SELECT p.name, p.strength, p.form, si.quantity, si.unit_price_pesewas AS unitPricePesewas,
+            si.line_total_pesewas AS lineTotalPesewas, b.batch_number AS batchNumber
+       FROM sale_items si
+       JOIN products p ON p.product_id = si.product_id
+       JOIN batches b ON b.batch_id = si.batch_id
+      WHERE si.tenant_id = {{tenant}} AND si.sale_id = ?
+      ORDER BY si.sale_item_id ASC`,
+    saleId,
+  );
+  const controlled = actor.scope.all<{ name: string; quantity: number; batchNumber: string; recipient: string | null }>(
+    `SELECT p.name, r.quantity, r.batch_number AS batchNumber, r.recipient_name AS recipient
+       FROM controlled_register r JOIN products p ON p.product_id = r.product_id
+      WHERE r.tenant_id = {{tenant}} AND r.reference_type = 'sale' AND r.reference_id = ?
+      ORDER BY r.created_at ASC`,
+    saleId,
+  );
+  const rx = sale.prescription_id
+    ? actor.scope.get<{ prescription_number: string }>(
+        "SELECT prescription_number FROM prescriptions WHERE tenant_id = {{tenant}} AND prescription_id = ?",
+        sale.prescription_id,
+      )
+    : undefined;
+
+  return {
+    saleId: sale.sale_id,
+    at: sale.sale_date,
+    branch: branch?.name ?? "—",
+    servedBy: staff?.name ?? "—",
+    paymentMethod: sale.payment_method,
+    subtotalPesewas: sale.subtotal_pesewas,
+    discountPesewas: sale.discount_pesewas,
+    totalPesewas: sale.total_pesewas,
+    amountTenderedPesewas: sale.amount_tendered_pesewas,
+    changePesewas: sale.change_pesewas,
+    lines,
+    controlled,
+    prescriptionNumber: rx?.prescription_number ?? null,
+  };
+}

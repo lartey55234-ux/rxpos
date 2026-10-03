@@ -3,7 +3,7 @@ import { assertCan } from "./permissions.ts";
 import { assertWithinPlan } from "./plans.ts";
 import { writeAudit } from "./audit.ts";
 import { recordControlledEntry } from "./controlled.ts";
-import { bool, newId, nowIso, todayIso } from "./util.ts";
+import { ValidationError, bool, newId, nowIso, todayIso } from "./util.ts";
 
 export type ControlledClass = "none" | "B" | "A";
 
@@ -291,4 +291,68 @@ export function writeOffBatch(actor: Actor, batchId: string, note: string): void
     before: { quantity: batch.quantity },
     after: { quantity: 0, note },
   });
+}
+
+export type ProductSearchRow = {
+  product_id: string;
+  name: string;
+  form: string | null;
+  strength: string | null;
+  category: string | null;
+  barcode: string | null;
+  price_pesewas: number;
+  reorder_level: number;
+  prescription_required: number;
+  controlled_class: ControlledClass;
+  sellable: number;
+  on_hand: number;
+  nearest_expiry: string | null;
+};
+
+/** Counter search: what a salesperson sees as they type, with sellable stock. */
+export function searchProducts(actor: Actor, branchId: string, query = "", limit = 25): ProductSearchRow[] {
+  const like = `%${query.trim().toLowerCase()}%`;
+  const rows = actor.scope.all<ProductSearchRow>(
+    `SELECT p.product_id, p.name, p.form, p.strength, c.name AS category, p.barcode,
+            p.default_price_pesewas AS price_pesewas, p.reorder_level,
+            p.prescription_required, p.controlled_class,
+            COALESCE((SELECT SUM(b.quantity) FROM batches b
+                       WHERE b.tenant_id = p.tenant_id AND b.product_id = p.product_id AND b.branch_id = ?
+                         AND b.quantity > 0 AND (b.expiry_date IS NULL OR b.expiry_date >= ?)), 0) AS sellable,
+            COALESCE((SELECT SUM(b.quantity) FROM batches b
+                       WHERE b.tenant_id = p.tenant_id AND b.product_id = p.product_id AND b.branch_id = ?), 0) AS on_hand,
+            (SELECT MIN(b.expiry_date) FROM batches b
+              WHERE b.tenant_id = p.tenant_id AND b.product_id = p.product_id AND b.branch_id = ?
+                AND b.quantity > 0 AND b.expiry_date IS NOT NULL) AS nearest_expiry
+       FROM products p
+       LEFT JOIN categories c ON c.category_id = p.category_id
+      WHERE p.tenant_id = {{tenant}} AND p.status = 'active'
+        AND (? = '%%' OR LOWER(p.name) LIKE ? OR LOWER(p.barcode) LIKE ? OR LOWER(COALESCE(p.brand,'')) LIKE ?)
+      ORDER BY p.name ASC
+      LIMIT ${Number(limit)}`,
+    branchId,
+    todayIso(),
+    branchId,
+    branchId,
+    like,
+    like,
+    like,
+    like,
+  );
+  return rows;
+}
+
+export function branchesFor(actor: Actor) {
+  return actor.scope.all<{ branch_id: string; name: string; address: string | null }>(
+    "SELECT branch_id, name, address FROM branches WHERE tenant_id = {{tenant}} ORDER BY created_at ASC",
+  );
+}
+
+/** Guard: a branch id from the client must belong to the acting tenant. */
+export function assertBranch(actor: Actor, branchId: string): void {
+  const row = actor.scope.get<{ branch_id: string }>(
+    "SELECT branch_id FROM branches WHERE tenant_id = {{tenant}} AND branch_id = ?",
+    branchId,
+  );
+  if (!row) throw new ValidationError(`Unknown branch ${branchId} for this pharmacy`);
 }

@@ -10,6 +10,12 @@
   "scripts": {
     "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.ts",
     "seed": "node --disable-warning=ExperimentalWarning scripts/seed.ts",
-    "check": "node --disable-warning=ExperimentalWarning --check src/tenant.ts"
+    "check": "node --disable-warning=ExperimentalWarning --check src/tenant.ts",
+    "build": "esbuild src/client/app.ts --bundle --format=esm --outfile=public/app.js --target=es2022 --log-level=warning",
+    "demo": "npm run build && node --disable-warning=ExperimentalWarning scripts/demo.ts",
+    "start": "node --disable-warning=ExperimentalWarning scripts/demo.ts"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
   }
 }

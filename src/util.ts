@@ -40,3 +40,10 @@ export function formatGhs(pesewas: number): string {
 export function bool(value: boolean | undefined): number {
   return value ? 1 : 0;
 }
+
+export class ValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ValidationError";
+  }
+}
