@@ -1,0 +1,15 @@
+{
+  "name": "rxpos",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pharmacy POS \u2014 multi-tenant counter, batches, expiry and controlled-drug compliance",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.ts",
+    "seed": "node --disable-warning=ExperimentalWarning scripts/seed.ts",
+    "check": "node --disable-warning=ExperimentalWarning --check src/tenant.ts"
+  }
+}
