@@ -27,9 +27,9 @@ export type ControlledEntry = {
  * and the date of supply — and the FDA requires those records to survive at
  * least two years and be available for inspection.
  */
-export function recordControlledEntry(scope: TenantScope, entry: ControlledEntry): string {
+export async function recordControlledEntry(scope: TenantScope, entry: ControlledEntry): Promise<string> {
   const entryId = newId("cdr");
-  scope.insert("controlled_register", {
+  await scope.insert("controlled_register", {
     entry_id: entryId,
     branch_id: entry.branchId,
     direction: entry.direction,
@@ -52,12 +52,12 @@ export function recordControlledEntry(scope: TenantScope, entry: ControlledEntry
 }
 
 /** The register as an inspector would read it: oldest first, with batch numbers. */
-export function readRegister(
+export async function readRegister(
   actor: Actor,
   branchId: string,
   fromDate: string,
   toDate: string,
-): Record<string, unknown>[] {
+): Promise<Record<string, unknown>[]> {
   assertCan(actor.role, "reports");
   return actor.scope.all(
     `SELECT r.entry_date, r.direction, p.name AS product, p.strength, r.batch_number, r.quantity,

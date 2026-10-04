@@ -1,8 +1,9 @@
 /**
  * Runtime configuration, read once from the environment.
  *
- * Local development keeps everything in memory. A deployed instance sets
- * DATA_DIR to a mounted disk so the database survives restarts and deploys.
+ * DATABASE_URL decides where the data lives: a postgres:// URL in production,
+ * or a file path for SQLite locally. DATA_DIR is the fallback for a SQLite file
+ * when no connection string is set.
  */
 
 import { join, resolve } from "node:path";
@@ -11,7 +12,8 @@ export type Config = {
   port: number;
   host: string;
   dataDir: string;
-  databasePath: string;
+  /** postgres:// for PostgreSQL, otherwise a SQLite file path or :memory:. */
+  databaseUrl: string;
   seedDemo: boolean;
   production: boolean;
 };
@@ -26,7 +28,7 @@ function flag(value: string | undefined, fallback: boolean): boolean {
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const production = env.NODE_ENV === "production";
   const dataDir = resolve(env.DATA_DIR ?? ".data");
-  const databasePath = env.DATABASE_PATH ?? join(dataDir, "rxpos.db");
+  const databaseUrl = env.DATABASE_URL ?? env.DATABASE_PATH ?? join(dataDir, "rxpos.db");
 
   const port = Number(env.PORT ?? DEFAULT_PORT);
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
@@ -37,7 +39,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     port,
     host: env.HOST ?? "0.0.0.0",
     dataDir,
-    databasePath,
+    databaseUrl,
     // A hosted demo wants the sample pharmacy; a real instance must not invent one.
     seedDemo: flag(env.SEED_DEMO, !production),
     production,

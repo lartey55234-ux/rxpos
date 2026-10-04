@@ -1,9 +1,9 @@
-import { openMigratedDb } from "../src/db.ts";
+import { openMigratedDatabase } from "../src/storage/index.ts";
 import { seedDemoPharmacy } from "../src/demo.ts";
 import { startServer } from "../src/server.ts";
 
-const db = openMigratedDb(":memory:");
-const demo = seedDemoPharmacy(db);
+const db = await openMigratedDatabase(":memory:");
+const demo = await seedDemoPharmacy(db);
 const port = Number(process.env.PORT ?? 4173);
 const server = await startServer(db, port);
 

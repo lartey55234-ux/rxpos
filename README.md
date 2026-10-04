@@ -138,7 +138,8 @@ and is what a host runs.
 | --- | --- | --- |
 | `PORT` | `4173` | Port to listen on. Hosts set this for you. |
 | `HOST` | `0.0.0.0` | Interface to bind. |
-| `DATA_DIR` | `.data` | Directory for the database when `DATABASE_PATH` is unset. |
+| `DATABASE_URL` | — | `postgres://…` in production. Takes precedence over everything below. |
+| `DATA_DIR` | `.data` | Directory for the SQLite file when `DATABASE_PATH` is unset. |
 | `DATABASE_PATH` | `$DATA_DIR/rxpos.db` | The SQLite file. `:memory:` throws data away on exit. |
 | `SEED_DEMO` | on unless `NODE_ENV=production` | Create the sample pharmacy, but only on an empty database. |
 | `NODE_ENV` | — | `production` turns off demo seeding. |
@@ -165,7 +166,18 @@ fly deploy
 ```
 
 **Anywhere else.** `npm ci && npm run build`, then `node scripts/serve.ts` with
-`NODE_ENV=production` and a mounted `DATA_DIR`. The health check is `GET /healthz`.
+`NODE_ENV=production`, `DATABASE_URL` pointing at PostgreSQL, and `SEED_DEMO=1`
+only if you want the sample pharmacy. The health check is `GET /healthz`.
+
+### Where the data lives
+
+Production runs on PostgreSQL; SQLite in memory is the fast local and test
+default. `DATABASE_URL` chooses. Both engines take the same `db/schema.sql`
+unchanged, and the drivers absorb the differences — placeholders, identifier
+case, and the fact that PostgreSQL returns `COUNT(*)` as a string.
+
+`npm test` runs the suite on SQLite. `npm run test:pg` runs the same suite
+against whatever `DATABASE_URL` points at, one file at a time. CI runs both.
 
 ## What the deployed instance does for itself
 

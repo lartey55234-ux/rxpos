@@ -1,5 +1,5 @@
 import type { Actor } from "./actor.ts";
-import { tx } from "./db.ts";
+import { TenantScope } from "./tenant.ts";
 import { assertCan } from "./permissions.ts";
 import { writeAudit } from "./audit.ts";
 import { recordControlledEntry } from "./controlled.ts";
@@ -75,11 +75,14 @@ type BatchRow = {
  *     may dispense one
  *   - every quantity change writes a stock movement
  */
-export function createSale(actor: Actor, input: SaleInput): SaleResult {
+export async function createSale(actor: Actor, input: SaleInput): Promise<SaleResult> {
   assertCan(actor.role, "sell");
   if (!input.lines.length) throw new SaleError("A sale needs at least one line");
 
-  return tx(actor.scope.db, () => {
+  return actor.scope.db.transaction(async (trx) => {
+    // The whole sale must run on one connection, so rebuild the scope against the
+    // transaction handle rather than the pool.
+    const me: Actor = { ...actor, scope: new TenantScope(trx, actor.scope.tenantId) };
     const saleId = newId("sal");
     const createdAt = nowIso();
     const today = todayIso();
@@ -90,7 +93,7 @@ export function createSale(actor: Actor, input: SaleInput): SaleResult {
     for (const line of input.lines) {
       if (line.quantity <= 0) throw new SaleError("Line quantities must be greater than zero");
 
-      const product = actor.scope.get<ProductRow>(
+      const product = await me.scope.get<ProductRow>(
         "SELECT product_id, name, perishable, controlled_class, prescription_required, status FROM products WHERE tenant_id = {{tenant}} AND product_id = ?",
         line.productId,
       );
@@ -103,7 +106,7 @@ export function createSale(actor: Actor, input: SaleInput): SaleResult {
         assertCan(actor.role, "dispense_controlled");
       }
 
-      const batches = actor.scope.all<BatchRow>(
+      const batches = await me.scope.all<BatchRow>(
         `SELECT batch_id, batch_number, quantity, selling_price_pesewas, expiry_date FROM batches
           WHERE tenant_id = {{tenant}} AND product_id = ? AND branch_id = ? AND quantity > 0
             AND (expiry_date IS NULL OR expiry_date >= ?)
@@ -126,10 +129,13 @@ export function createSale(actor: Actor, input: SaleInput): SaleResult {
         const take = Math.min(remaining, batch.quantity);
         remaining -= take;
 
-        const updated = actor.scope.db
-          .prepare("UPDATE batches SET quantity = quantity - ? WHERE tenant_id = ? AND batch_id = ? AND quantity >= ?")
-          .run(take, actor.scope.tenantId, batch.batch_id, take);
-        if (updated.changes !== 1) throw new SaleError(`Stock changed while selling ${product.name}; retry the sale`);
+        // Conditional update: if another till sold the same batch first this changes
+        // nothing, and the sale is refused rather than overselling.
+        const updated = await trx.run(
+          "UPDATE batches SET quantity = quantity - ? WHERE tenant_id = ? AND batch_id = ? AND quantity >= ?",
+          [take, actor.scope.tenantId, batch.batch_id, take],
+        );
+        if (updated !== 1) throw new SaleError(`Stock changed while selling ${product.name}; retry the sale`);
 
         const lineTotal = take * batch.selling_price_pesewas;
         items.push({
@@ -142,7 +148,7 @@ export function createSale(actor: Actor, input: SaleInput): SaleResult {
           lineTotalPesewas: lineTotal,
         });
 
-        actor.scope.insert("stock_movements", {
+        await me.scope.insert("stock_movements", {
           movement_id: newId("mov"),
           batch_id: batch.batch_id,
           branch_id: input.branchId,
@@ -163,7 +169,7 @@ export function createSale(actor: Actor, input: SaleInput): SaleResult {
         "This sale needs a prescription: controlled and prescription-only items cannot be supplied without one",
       );
     }
-    const prescription = input.prescriptionId ? getPrescription(actor, input.prescriptionId) : undefined;
+    const prescription = input.prescriptionId ? await getPrescription(me, input.prescriptionId) : undefined;
     if (input.prescriptionId && !prescription) throw new SaleError(`Unknown prescription ${input.prescriptionId}`);
 
     const subtotal = items.reduce((sum, i) => sum + i.lineTotalPesewas, 0);
@@ -177,7 +183,7 @@ export function createSale(actor: Actor, input: SaleInput): SaleResult {
     }
     const change = input.paymentMethod === "Cash" ? tendered - total : 0;
 
-    actor.scope.insert("sales", {
+    await me.scope.insert("sales", {
       sale_id: saleId,
       branch_id: input.branchId,
       user_id: actor.userId,
@@ -195,7 +201,7 @@ export function createSale(actor: Actor, input: SaleInput): SaleResult {
     });
 
     for (const item of items) {
-      actor.scope.insert("sale_items", {
+      await me.scope.insert("sale_items", {
         sale_item_id: newId("sli"),
         sale_id: saleId,
         product_id: item.productId,
@@ -207,7 +213,7 @@ export function createSale(actor: Actor, input: SaleInput): SaleResult {
       });
     }
 
-    actor.scope.insert("payments", {
+    await me.scope.insert("payments", {
       payment_id: newId("pay"),
       sale_id: saleId,
       method: input.paymentMethod,
@@ -217,12 +223,12 @@ export function createSale(actor: Actor, input: SaleInput): SaleResult {
     });
 
     for (const item of items) {
-      const product = actor.scope.get<ProductRow>(
+      const product = await me.scope.get<ProductRow>(
         "SELECT product_id, name, perishable, controlled_class, prescription_required, status FROM products WHERE tenant_id = {{tenant}} AND product_id = ?",
         item.productId,
       );
       if (!product || product.controlled_class === "none") continue;
-      recordControlledEntry(actor.scope, {
+      await recordControlledEntry(actor.scope, {
         branchId: input.branchId,
         direction: "supplied",
         productId: item.productId,
@@ -240,7 +246,7 @@ export function createSale(actor: Actor, input: SaleInput): SaleResult {
       controlledEntries += 1;
     }
 
-    writeAudit(actor.scope, {
+    await writeAudit(actor.scope, {
       userId: actor.userId,
       entityType: "sale",
       entityId: saleId,
@@ -279,8 +285,8 @@ export type Receipt = {
 };
 
 /** Everything a printed receipt needs, read back from what was actually recorded. */
-export function getReceipt(actor: Actor, saleId: string): Receipt {
-  const sale = actor.scope.get<{
+export async function getReceipt(actor: Actor, saleId: string): Promise<Receipt> {
+  const sale = await actor.scope.get<{
     sale_id: string;
     sale_date: string;
     branch_id: string;
@@ -298,17 +304,17 @@ export function getReceipt(actor: Actor, saleId: string): Receipt {
   );
   if (!sale) throw new SaleError(`Unknown sale ${saleId}`);
 
-  const branch = actor.scope.get<{ name: string }>(
+  const branch = await actor.scope.get<{ name: string }>(
     "SELECT name FROM branches WHERE tenant_id = {{tenant}} AND branch_id = ?",
     sale.branch_id,
   );
-  const staff = actor.scope.get<{ name: string }>(
+  const staff = await actor.scope.get<{ name: string }>(
     "SELECT name FROM users WHERE tenant_id = {{tenant}} AND user_id = ?",
     sale.user_id,
   );
-  const lines = actor.scope.all<ReceiptLine>(
-    `SELECT p.name, p.strength, p.form, si.quantity, si.unit_price_pesewas AS unitPricePesewas,
-            si.line_total_pesewas AS lineTotalPesewas, b.batch_number AS batchNumber
+  const lines = await actor.scope.all<ReceiptLine>(
+    `SELECT p.name, p.strength, p.form, si.quantity, si.unit_price_pesewas AS "unitPricePesewas",
+            si.line_total_pesewas AS "lineTotalPesewas", b.batch_number AS "batchNumber"
        FROM sale_items si
        JOIN products p ON p.product_id = si.product_id
        JOIN batches b ON b.batch_id = si.batch_id
@@ -316,15 +322,15 @@ export function getReceipt(actor: Actor, saleId: string): Receipt {
       ORDER BY si.sale_item_id ASC`,
     saleId,
   );
-  const controlled = actor.scope.all<{ name: string; quantity: number; batchNumber: string; recipient: string | null }>(
-    `SELECT p.name, r.quantity, r.batch_number AS batchNumber, r.recipient_name AS recipient
+  const controlled = await actor.scope.all<{ name: string; quantity: number; batchNumber: string; recipient: string | null }>(
+    `SELECT p.name, r.quantity, r.batch_number AS "batchNumber", r.recipient_name AS recipient
        FROM controlled_register r JOIN products p ON p.product_id = r.product_id
       WHERE r.tenant_id = {{tenant}} AND r.reference_type = 'sale' AND r.reference_id = ?
       ORDER BY r.created_at ASC`,
     saleId,
   );
   const rx = sale.prescription_id
-    ? actor.scope.get<{ prescription_number: string }>(
+    ? await actor.scope.get<{ prescription_number: string }>(
         "SELECT prescription_number FROM prescriptions WHERE tenant_id = {{tenant}} AND prescription_id = ?",
         sale.prescription_id,
       )

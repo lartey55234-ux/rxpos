@@ -1,12 +1,12 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import type { Server } from "node:http";
-import { openMigratedDb } from "../src/db.ts";
+import { freshTestDatabase } from "../src/testing.ts";
 import { seedDemoPharmacy } from "../src/demo.ts";
 import { startServer } from "../src/server.ts";
 
-const db = openMigratedDb();
-const demo = seedDemoPharmacy(db);
+const db = await freshTestDatabase();
+const demo = await seedDemoPharmacy(db);
 const server: Server = await startServer(db, 0);
 const port = (server.address() as { port: number }).port;
 const base = `http://127.0.0.1:${port}`;

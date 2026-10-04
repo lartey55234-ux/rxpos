@@ -6,10 +6,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Server } from "node:http";
-import { openMigratedDb } from "../src/db.ts";
+import { freshTestDatabase } from "../src/testing.ts";
 import { startServer } from "../src/server.ts";
 
-const db = openMigratedDb(":memory:");
+const db = await freshTestDatabase();
 const server: Server = await startServer(db, 0, undefined, "127.0.0.1", {
   loginLimit: 1000,
   signupLimit: 1000,

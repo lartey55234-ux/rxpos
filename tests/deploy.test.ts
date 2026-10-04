@@ -5,11 +5,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Server } from "node:http";
-import { openMigratedDb } from "../src/db.ts";
+import { freshTestDatabase } from "../src/testing.ts";
 import { startServer } from "../src/server.ts";
 import { RateLimitError, RateLimiter } from "../src/ratelimit.ts";
 
-const db = openMigratedDb(":memory:");
+const db = await freshTestDatabase();
 // Generous limits here: the rate limiter gets its own test below.
 const server: Server = await startServer(db, 0, undefined, "127.0.0.1", { loginLimit: 100, signupLimit: 100 });
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
@@ -126,7 +126,7 @@ test("the limiter stops a burst and then lets the window roll over", () => {
 });
 
 test("signup is rate limited out of the box", async () => {
-  const strict = openMigratedDb(":memory:");
+  const strict = await freshTestDatabase();
   const limited = await startServer(strict, 0, undefined, "127.0.0.1");
   const port = (limited.address() as { port: number }).port;
   try {

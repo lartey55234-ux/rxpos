@@ -28,8 +28,9 @@ export class SqliteDatabase implements Database {
     return this.handle.prepare(sql).get(...(params as never[])) as T | undefined;
   }
 
-  async run(sql: string, params: unknown[] = []): Promise<void> {
-    this.handle.prepare(sql).run(...(params as never[]));
+  async run(sql: string, params: unknown[] = []): Promise<number> {
+    const result = this.handle.prepare(sql).run(...(params as never[]));
+    return Number(result.changes);
   }
 
   async exec(sql: string): Promise<void> {

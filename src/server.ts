@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Db } from "./db.ts";
+import type { Database } from "./storage/index.ts";
 import { AuthError, addStaff, authenticate, login, registerPharmacy, seedPlans } from "./auth.ts";
 import { RateLimitError, RateLimiter } from "./ratelimit.ts";
 import { PermissionError, can, type Permission, type Role } from "./permissions.ts";
@@ -134,7 +134,7 @@ export type HandlerOptions = {
 };
 
 export function createRequestHandler(
-  db: Db,
+  db: Database,
   publicDir = join(here, "public"),
   options: HandlerOptions = {},
 ) {
@@ -154,7 +154,8 @@ export function createRequestHandler(
     if (path === "/healthz") {
       let healthy = false;
       try {
-        healthy = (db.prepare("SELECT 1 AS ok").get() as { ok: number }).ok === 1;
+        const row = await db.get<{ ok: number }>("SELECT 1 AS ok");
+        healthy = row?.ok === 1;
       } catch {
         healthy = false;
       }
@@ -168,7 +169,7 @@ export function createRequestHandler(
     }
 
     try {
-      const actor = (): Actor => {
+      const actor = async (): Promise<Actor> => {
         const header = req.headers.authorization ?? "";
         const token = header.startsWith("Bearer ") ? header.slice(7) : "";
         if (!token) throw new AuthError("Missing bearer token");
@@ -178,8 +179,8 @@ export function createRequestHandler(
       if (method === "POST" && path === "/api/login") {
         loginLimiter.hit(clientKey(req));
         const body = await readJson(req);
-        const session = login(db, String(body.email ?? ""), String(body.password ?? ""));
-        send(res, 200, { token: session.token, ...sessionPayload(db, authenticate(db, session.token)) });
+        const session = await login(db, String(body.email ?? ""), String(body.password ?? ""));
+        send(res, 200, { token: session.token, ...(await sessionPayload(db, await authenticate(db, session.token))) });
         return;
       }
 
@@ -187,20 +188,20 @@ export function createRequestHandler(
       if (method === "POST" && path === "/api/signup") {
         signupLimiter.hit(clientKey(req));
         const body = await readJson(req);
-        seedPlans(db);
+        await seedPlans(db);
 
         const email = String(body.email ?? "").trim().toLowerCase();
         const planId = body.planId ? String(body.planId) : "starter";
-        if (!db.prepare("SELECT 1 AS x FROM plans WHERE plan_id = ?").get(planId)) {
+        if (!(await db.get("SELECT 1 AS x FROM plans WHERE plan_id = ?", [planId]))) {
           throw new ValidationError(`Unknown plan ${planId}`);
         }
         // Email is unique across the workspace, so catch the clash before the insert.
-        if (db.prepare("SELECT 1 AS x FROM users WHERE email = ?").get(email)) {
+        if (await db.get("SELECT 1 AS x FROM users WHERE email = ?", [email])) {
           send(res, 409, { error: "That email already has an account. Sign in instead." });
           return;
         }
 
-        const result = registerPharmacy(db, {
+        const result = await registerPharmacy(db, {
           pharmacyName: String(body.pharmacyName ?? ""),
           ownerName: String(body.ownerName ?? ""),
           email,
@@ -209,20 +210,20 @@ export function createRequestHandler(
           branchName: body.branchName ? String(body.branchName) : undefined,
           phone: body.phone ? String(body.phone) : null,
         });
-        send(res, 201, { token: result.token, ...sessionPayload(db, authenticate(db, result.token)) });
+        send(res, 201, { token: result.token, ...(await sessionPayload(db, await authenticate(db, result.token))) });
         return;
       }
 
       if (method === "GET" && path === "/api/session") {
-        send(res, 200, sessionPayload(db, actor()));
+        send(res, 200, await sessionPayload(db, await actor()));
         return;
       }
 
       if (method === "GET" && path === "/api/products") {
-        const me = actor();
+        const me = await actor();
         const branchId = String(url.searchParams.get("branchId") ?? "");
-        assertBranch(me, branchId);
-        const products = searchProducts(me, branchId, url.searchParams.get("q") ?? "");
+        await assertBranch(me, branchId);
+        const products = await searchProducts(me, branchId, url.searchParams.get("q") ?? "");
         // Cost price is what the pharmacy paid for the stock, so it follows the
         // same rule as asset values: the owner sees it and nobody else does.
         if (!can(me.role, "assets")) {
@@ -233,44 +234,44 @@ export function createRequestHandler(
       }
 
       if (method === "GET" && path === "/api/alerts") {
-        const me = actor();
+        const me = await actor();
         const branchId = String(url.searchParams.get("branchId") ?? "");
-        assertBranch(me, branchId);
+        await assertBranch(me, branchId);
         send(res, 200, {
-          expired: expiredBatches(me, branchId),
-          expiring: expiringWithin(me, branchId, 90),
-          low: lowStock(me, branchId),
+          expired: await expiredBatches(me, branchId),
+          expiring: await expiringWithin(me, branchId, 90),
+          low: await lowStock(me, branchId),
         });
         return;
       }
 
       if (method === "GET" && path === "/api/reports") {
-        const me = actor();
+        const me = await actor();
         const branchId = String(url.searchParams.get("branchId") ?? "");
-        assertBranch(me, branchId);
+        await assertBranch(me, branchId);
         send(res, 200, {
-          today: todayTotals(me, branchId),
-          week: salesSummary(me, branchId, 7),
-          top: topProducts(me, branchId, 7),
-          assets: can(me.role, "assets") ? assetValues(me, branchId) : null,
+          today: await todayTotals(me, branchId),
+          week: await salesSummary(me, branchId, 7),
+          top: await topProducts(me, branchId, 7),
+          assets: can(me.role, "assets") ? await assetValues(me, branchId) : null,
         });
         return;
       }
 
       if (method === "GET" && path === "/api/register") {
-        const me = actor();
+        const me = await actor();
         const branchId = String(url.searchParams.get("branchId") ?? "");
-        assertBranch(me, branchId);
+        await assertBranch(me, branchId);
         const to = url.searchParams.get("to") ?? new Date().toISOString().slice(0, 10);
         const from = url.searchParams.get("from") ?? to;
-        send(res, 200, { entries: readRegister(me, branchId, from, to) });
+        send(res, 200, { entries: await readRegister(me, branchId, from, to) });
         return;
       }
 
       if (method === "POST" && path === "/api/prescriptions") {
-        const me = actor();
+        const me = await actor();
         const body = await readJson(req);
-        const prescriptionId = createPrescription(me, {
+        const prescriptionId = await createPrescription(me, {
           branchId: String(body.branchId ?? ""),
           prescriptionNumber: String(body.prescriptionNumber ?? ""),
           patientName: String(body.patientName ?? ""),
@@ -283,9 +284,9 @@ export function createRequestHandler(
       }
 
       if (method === "POST" && path === "/api/sales") {
-        const me = actor();
+        const me = await actor();
         const body = await readJson(req);
-        const result = createSale(me, {
+        const result = await createSale(me, {
           branchId: String(body.branchId ?? ""),
           lines: (body.lines as { productId: string; quantity: number }[]) ?? [],
           paymentMethod: (body.paymentMethod as "Cash" | "Mobile Money" | "Card") ?? "Cash",
@@ -295,20 +296,20 @@ export function createRequestHandler(
           recipientName: body.recipientName ? String(body.recipientName) : null,
           recipientAddress: body.recipientAddress ? String(body.recipientAddress) : null,
         });
-        send(res, 201, { sale: result, receipt: getReceipt(me, result.saleId) });
+        send(res, 201, { sale: result, receipt: await getReceipt(me, result.saleId) });
         return;
       }
 
       const receiptMatch = /^\/api\/sales\/([^/]+)\/receipt$/.exec(path);
       if (method === "GET" && receiptMatch) {
-        send(res, 200, { receipt: getReceipt(actor(), receiptMatch[1]) });
+        send(res, 200, { receipt: await getReceipt(await actor(), receiptMatch[1]) });
         return;
       }
 
       if (method === "POST" && path === "/api/batches") {
-        const me = actor();
+        const me = await actor();
         const body = await readJson(req);
-        const batchId = receiveBatch(me, {
+        const batchId = await receiveBatch(me, {
           branchId: str(body.branchId),
           productId: str(body.productId),
           batchNumber: str(body.batchNumber),
@@ -323,9 +324,9 @@ export function createRequestHandler(
       }
 
       if (method === "POST" && path === "/api/products") {
-        const me = actor();
+        const me = await actor();
         const body = await readJson(req);
-        const productId = createProduct(me, {
+        const productId = await createProduct(me, {
           name: str(body.name),
           categoryId: optional(body.categoryId),
           brand: optional(body.brand),
@@ -345,10 +346,10 @@ export function createRequestHandler(
       }
 
       if (method === "POST" && path === "/api/suppliers") {
-        const me = actor();
+        const me = await actor();
         const body = await readJson(req);
         send(res, 201, {
-          supplierId: createSupplier(me, {
+          supplierId: await createSupplier(me, {
             name: str(body.name),
             phone: optional(body.phone),
             email: optional(body.email),
@@ -361,9 +362,9 @@ export function createRequestHandler(
       /* ------------------- setting a pharmacy up, after signup ------------------ */
 
       if (method === "GET" && path === "/api/suppliers") {
-        const me = actor();
+        const me = await actor();
         send(res, 200, {
-          suppliers: me.scope.all(
+          suppliers: await me.scope.all(
             "SELECT supplier_id, name, phone, email, address FROM suppliers WHERE tenant_id = {{tenant}} ORDER BY name",
           ),
         });
@@ -371,9 +372,9 @@ export function createRequestHandler(
       }
 
       if (method === "GET" && path === "/api/categories") {
-        const me = actor();
+        const me = await actor();
         send(res, 200, {
-          categories: me.scope.all(
+          categories: await me.scope.all(
             "SELECT category_id, name, description FROM categories WHERE tenant_id = {{tenant}} ORDER BY name",
           ),
         });
@@ -381,32 +382,32 @@ export function createRequestHandler(
       }
 
       if (method === "POST" && path === "/api/categories") {
-        const me = actor();
+        const me = await actor();
         const body = await readJson(req);
         send(res, 201, {
-          categoryId: createCategory(me, str(body.name), optional(body.description) ?? undefined),
+          categoryId: await createCategory(me, str(body.name), optional(body.description) ?? undefined),
         });
         return;
       }
 
       // Branches change what the plan charges for, so the domain gates this on "plans".
       if (method === "POST" && path === "/api/branches") {
-        const me = actor();
+        const me = await actor();
         const body = await readJson(req);
-        const branchId = createBranch(me, {
+        const branchId = await createBranch(me, {
           name: str(body.name),
           address: optional(body.address),
           phone: optional(body.phone),
         });
-        send(res, 201, { branchId, branches: branchesFor(me) });
+        send(res, 201, { branchId, branches: await branchesFor(me) });
         return;
       }
 
       if (method === "GET" && path === "/api/staff") {
-        const me = actor();
+        const me = await actor();
         if (!can(me.role, "users")) throw new PermissionError("Only the owner can see staff accounts");
         send(res, 200, {
-          staff: me.scope.all(
+          staff: await me.scope.all(
             "SELECT user_id, name, email, role, status, branch_id, created_at FROM users WHERE tenant_id = {{tenant}} ORDER BY created_at",
           ),
         });
@@ -414,13 +415,13 @@ export function createRequestHandler(
       }
 
       if (method === "POST" && path === "/api/staff") {
-        const me = actor();
+        const me = await actor();
         const body = await readJson(req);
         const role = str(body.role) || "salesperson";
         if (role !== "admin" && role !== "salesperson") {
           throw new ValidationError("Role must be admin or salesperson");
         }
-        const userId = addStaff(db, me, {
+        const userId = await addStaff(db, me, {
           name: str(body.name),
           email: str(body.email),
           password: str(body.password),
@@ -433,9 +434,9 @@ export function createRequestHandler(
 
       const writeOffMatch = /^\/api\/batches\/([^/]+)\/writeoff$/.exec(path);
       if (method === "POST" && writeOffMatch) {
-        const me = actor();
+        const me = await actor();
         const body = await readJson(req);
-        writeOffBatch(me, writeOffMatch[1], str(body.note) || "Written off");
+        await writeOffBatch(me, writeOffMatch[1], str(body.note) || "Written off");
         send(res, 200, { ok: true });
         return;
       }
@@ -449,13 +450,13 @@ export function createRequestHandler(
   };
 }
 
-function sessionPayload(db: Db, me: Actor) {
-  const tenant = me.scope.tenant<{ name: string }>();
-  const user = me.scope.get<{ name: string }>(
+async function sessionPayload(db: Database, me: Actor) {
+  const tenant = await me.scope.tenant<{ name: string }>();
+  const user = await me.scope.get<{ name: string }>(
     "SELECT name FROM users WHERE tenant_id = {{tenant}} AND user_id = ?",
     me.userId,
   );
-  const plan = planFor(me.scope);
+  const plan = await planFor(me.scope);
   return {
     user: { id: me.userId, name: user?.name ?? "—", role: me.role },
     tenant: {
@@ -463,13 +464,13 @@ function sessionPayload(db: Db, me: Actor) {
       name: tenant.name,
       plan: { id: plan.plan_id, name: plan.name, pricePesewas: plan.price_pesewas },
       usage: {
-        products: usageFor(me.scope, "products"),
-        shops: usageFor(me.scope, "shops"),
-        staff: usageFor(me.scope, "staff"),
-        suppliers: usageFor(me.scope, "suppliers"),
+        products: await usageFor(me.scope, "products"),
+        shops: await usageFor(me.scope, "shops"),
+        staff: await usageFor(me.scope, "staff"),
+        suppliers: await usageFor(me.scope, "suppliers"),
       },
     },
-    branches: branchesFor(me),
+    branches: await branchesFor(me),
     permissions: Object.fromEntries(PERMISSIONS.map((p) => [p, can(me.role as Role, p)])),
   };
 }

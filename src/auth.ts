@@ -1,6 +1,5 @@
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import type { Db } from "./db.ts";
-import { tx } from "./db.ts";
+import type { Database } from "./storage/index.ts";
 import { TenantScope } from "./tenant.ts";
 import type { Actor } from "./actor.ts";
 import { PLAN_SEED, assertWithinPlan } from "./plans.ts";
@@ -25,14 +24,14 @@ function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-export function seedPlans(db: Db): void {
-  const row = db.prepare("SELECT COUNT(*) AS n FROM plans").get() as { n: number };
-  if (row.n > 0) return;
-  const stmt = db.prepare(
-    "INSERT INTO plans (plan_id, name, price_pesewas, max_products, max_shops, max_staff, max_suppliers) VALUES (?, ?, ?, ?, ?, ?, ?)",
-  );
-  for (const p of PLAN_SEED) {
-    stmt.run(p.plan_id, p.name, p.price_pesewas, p.max_products, p.max_shops, p.max_staff, p.max_suppliers);
+export async function seedPlans(db: Database): Promise<void> {
+  const row = await db.get<{ n: number }>("SELECT COUNT(*) AS n FROM plans");
+  if ((row?.n ?? 0) > 0) return;
+  for (const plan of PLAN_SEED) {
+    await db.run(
+      "INSERT INTO plans (plan_id, name, price_pesewas, max_products, max_shops, max_staff, max_suppliers) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [plan.plan_id, plan.name, plan.price_pesewas, plan.max_products, plan.max_shops, plan.max_staff, plan.max_suppliers],
+    );
   }
 }
 
@@ -74,38 +73,42 @@ export function validateRegistration(input: RegisterInput): void {
 }
 
 /** Create a pharmacy (tenant) with its first branch and an owner account. */
-export function registerPharmacy(db: Db, input: RegisterInput): RegisterResult {
+export async function registerPharmacy(db: Database, input: RegisterInput): Promise<RegisterResult> {
   validateRegistration(input);
-  seedPlans(db);
+  await seedPlans(db);
   const planId = input.planId ?? "starter";
   const email = input.email.trim().toLowerCase();
 
-  return tx(db, () => {
-    const tenantId = newId("ten");
-    const branchId = newId("br");
-    const userId = newId("usr");
-    const createdAt = nowIso();
-    const { hash, salt } = hashPassword(input.password);
+  const tenantId = newId("ten");
+  const branchId = newId("br");
+  const userId = newId("usr");
+  const createdAt = nowIso();
+  const { hash, salt } = hashPassword(input.password);
 
-    db.prepare(
+  // One transaction, so a failure part-way leaves no half-built pharmacy behind.
+  return db.transaction(async (trx) => {
+    await trx.run(
       "INSERT INTO tenants (tenant_id, name, phone, email, plan_id, status, created_at) VALUES (?, ?, ?, ?, ?, 'active', ?)",
-    ).run(tenantId, input.pharmacyName, input.phone ?? null, email, planId, createdAt);
+      [tenantId, input.pharmacyName, input.phone ?? null, email, planId, createdAt],
+    );
 
-    db.prepare(
+    await trx.run(
       "INSERT INTO branches (branch_id, tenant_id, name, address, phone, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).run(branchId, tenantId, input.branchName ?? "Main Pharmacy", null, null, createdAt);
+      [branchId, tenantId, input.branchName ?? "Main Pharmacy", null, null, createdAt],
+    );
 
-    db.prepare(
+    await trx.run(
       "INSERT INTO users (user_id, tenant_id, branch_id, name, email, phone, password_hash, password_salt, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'owner', 'active', ?)",
-    ).run(userId, tenantId, null, input.ownerName, email, null, hash, salt, createdAt);
+      [userId, tenantId, null, input.ownerName, email, null, hash, salt, createdAt],
+    );
 
-    db.prepare(
+    await trx.run(
       "INSERT INTO subscriptions (subscription_id, tenant_id, plan_id, started_at, expires_at, amount_pesewas, status) VALUES (?, ?, ?, ?, ?, 0, 'active')",
-    ).run(newId("sub"), tenantId, planId, createdAt, null);
+      [newId("sub"), tenantId, planId, createdAt, null],
+    );
 
-    const session = createSession(db, tenantId, userId);
-    const scope = new TenantScope(db, tenantId);
-    writeAudit(scope, {
+    const session = await createSession(trx, tenantId, userId);
+    await writeAudit(new TenantScope(trx, tenantId), {
       userId,
       entityType: "tenant",
       entityId: tenantId,
@@ -117,13 +120,14 @@ export function registerPharmacy(db: Db, input: RegisterInput): RegisterResult {
   });
 }
 
-function createSession(db: Db, tenantId: string, userId: string) {
+async function createSession(db: Database, tenantId: string, userId: string) {
   const token = randomBytes(32).toString("base64url");
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 86_400_000).toISOString();
-  db.prepare(
+  await db.run(
     "INSERT INTO sessions (session_id, tenant_id, user_id, token_hash, created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, NULL)",
-  ).run(newId("ses"), tenantId, userId, hashToken(token), createdAt, expiresAt);
+    [newId("ses"), tenantId, userId, hashToken(token), createdAt, expiresAt],
+  );
   return { token, expiresAt };
 }
 
@@ -134,14 +138,18 @@ export class AuthError extends Error {
   }
 }
 
-export function login(db: Db, email: string, password: string) {
-  const row = db
-    .prepare(
-      "SELECT user_id, tenant_id, role, password_hash, password_salt, status FROM users WHERE email = ?",
-    )
-    .get(email.trim().toLowerCase()) as
-    | { user_id: string; tenant_id: string; role: Role; password_hash: string; password_salt: string; status: string }
-    | undefined;
+export async function login(db: Database, email: string, password: string) {
+  const row = await db.get<{
+    user_id: string;
+    tenant_id: string;
+    role: Role;
+    password_hash: string;
+    password_salt: string;
+    status: string;
+  }>(
+    "SELECT user_id, tenant_id, role, password_hash, password_salt, status FROM users WHERE email = ?",
+    [email.trim().toLowerCase()],
+  );
 
   // Same error for unknown user and wrong password: do not leak which emails exist.
   if (!row) throw new AuthError("Invalid email or password");
@@ -150,53 +158,52 @@ export function login(db: Db, email: string, password: string) {
   }
   if (row.status !== "active") throw new AuthError("This account is not active");
 
-  const session = createSession(db, row.tenant_id, row.user_id);
-  const scope = new TenantScope(db, row.tenant_id);
-  writeAudit(scope, { userId: row.user_id, entityType: "user", entityId: row.user_id, action: "login" });
+  const session = await createSession(db, row.tenant_id, row.user_id);
+  await writeAudit(new TenantScope(db, row.tenant_id), {
+    userId: row.user_id,
+    entityType: "user",
+    entityId: row.user_id,
+    action: "login",
+  });
   return { token: session.token, expiresAt: session.expiresAt, tenantId: row.tenant_id, userId: row.user_id, role: row.role };
 }
 
 /** Resolve a bearer token to an actor. Expired and revoked sessions are rejected. */
-export function authenticate(db: Db, token: string): Actor {
-  const row = db
-    .prepare(
-      "SELECT tenant_id, user_id, expires_at, revoked_at FROM sessions WHERE token_hash = ?",
-    )
-    .get(hashToken(token)) as
-    | { tenant_id: string; user_id: string; expires_at: string; revoked_at: string | null }
-    | undefined;
+export async function authenticate(db: Database, token: string): Promise<Actor> {
+  const row = await db.get<{ tenant_id: string; user_id: string; expires_at: string; revoked_at: string | null }>(
+    "SELECT tenant_id, user_id, expires_at, revoked_at FROM sessions WHERE token_hash = ?",
+    [hashToken(token)],
+  );
 
   if (!row) throw new AuthError("Unknown session");
   if (row.revoked_at) throw new AuthError("Session revoked");
   if (row.expires_at <= nowIso()) throw new AuthError("Session expired");
 
-  const user = db
-    .prepare("SELECT role, status FROM users WHERE user_id = ? AND tenant_id = ?")
-    .get(row.user_id, row.tenant_id) as { role: Role; status: string } | undefined;
+  const user = await db.get<{ role: Role; status: string }>(
+    "SELECT role, status FROM users WHERE user_id = ? AND tenant_id = ?",
+    [row.user_id, row.tenant_id],
+  );
   if (!user || user.status !== "active") throw new AuthError("Account is not active");
 
   return { scope: new TenantScope(db, row.tenant_id), userId: row.user_id, role: user.role };
 }
 
-export function logout(db: Db, token: string): void {
-  db.prepare("UPDATE sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL").run(
-    nowIso(),
-    hashToken(token),
-  );
+export async function logout(db: Database, token: string): Promise<void> {
+  await db.run("UPDATE sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL", [nowIso(), hashToken(token)]);
 }
 
 /** Owner-only: add a staff account. Enforces the plan's staff allowance. */
-export function addStaff(
-  db: Db,
+export async function addStaff(
+  db: Database,
   actor: Actor,
   input: { name: string; email: string; password: string; role: Exclude<Role, "owner">; branchId?: string | null },
-): string {
+): Promise<string> {
   assertCan(actor.role, "users");
-  assertWithinPlan(actor.scope, "staff");
+  await assertWithinPlan(actor.scope, "staff");
 
   const userId = newId("usr");
   const { hash, salt } = hashPassword(input.password);
-  actor.scope.insert("users", {
+  await actor.scope.insert("users", {
     user_id: userId,
     branch_id: input.branchId ?? null,
     name: input.name,
@@ -208,7 +215,7 @@ export function addStaff(
     status: "active",
     created_at: nowIso(),
   });
-  writeAudit(actor.scope, {
+  await writeAudit(actor.scope, {
     userId: actor.userId,
     entityType: "user",
     entityId: userId,

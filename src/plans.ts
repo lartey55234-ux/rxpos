@@ -27,18 +27,16 @@ export class PlanLimitError extends Error {
   }
 }
 
-export function planFor(scope: TenantScope): PlanSeed {
-  const tenant = scope.tenant<{ plan_id: string }>();
-  const row = scope.db.prepare("SELECT * FROM plans WHERE plan_id = ?").get(tenant.plan_id) as
-    | PlanSeed
-    | undefined;
+export async function planFor(scope: TenantScope): Promise<PlanSeed> {
+  const tenant = await scope.tenant<{ plan_id: string }>();
+  const row = await scope.db.get<PlanSeed>("SELECT * FROM plans WHERE plan_id = ?", [tenant.plan_id]);
   if (!row) throw new Error(`Unknown plan ${tenant.plan_id}`);
   return row;
 }
 
-export function usageFor(scope: TenantScope, kind: PlanKind): number {
-  const count = (sql: string): number => {
-    const row = scope.db.prepare(sql).get(scope.tenantId) as { n: number } | undefined;
+export async function usageFor(scope: TenantScope, kind: PlanKind): Promise<number> {
+  const count = async (sql: string): Promise<number> => {
+    const row = await scope.db.get<{ n: number }>(sql, [scope.tenantId]);
     return row?.n ?? 0;
   };
   switch (kind) {
@@ -54,9 +52,9 @@ export function usageFor(scope: TenantScope, kind: PlanKind): number {
 }
 
 /** Call before creating a product, branch, staff account or supplier. */
-export function assertWithinPlan(scope: TenantScope, kind: PlanKind): void {
-  const plan = planFor(scope);
-  const used = usageFor(scope, kind);
+export async function assertWithinPlan(scope: TenantScope, kind: PlanKind): Promise<void> {
+  const plan = await planFor(scope);
+  const used = await usageFor(scope, kind);
   const limit = kind === "products" ? plan.max_products
     : kind === "shops" ? plan.max_shops
     : kind === "staff" ? plan.max_staff

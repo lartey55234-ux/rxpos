@@ -1,4 +1,4 @@
-import type { Db } from "./db.ts";
+import type { Database } from "./storage/index.ts";
 
 const MARKER = "{{tenant}}";
 
@@ -15,10 +15,10 @@ const MARKER = "{{tenant}}";
  * A query with no marker, or with two, is refused before it reaches the database.
  */
 export class TenantScope {
-  db: Db;
+  db: Database;
   tenantId: string;
 
-  constructor(db: Db, tenantId: string) {
+  constructor(db: Database, tenantId: string) {
     this.db = db;
     this.tenantId = tenantId;
   }
@@ -40,34 +40,35 @@ export class TenantScope {
     };
   }
 
-  all<T = Record<string, unknown>>(sql: string, ...params: unknown[]): T[] {
+  async all<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T[]> {
     const bound = this.bind(sql, params);
-    return this.db.prepare(bound.sql).all(...(bound.params as never[])) as T[];
+    return this.db.all<T>(bound.sql, bound.params);
   }
 
-  get<T = Record<string, unknown>>(sql: string, ...params: unknown[]): T | undefined {
+  async get<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T | undefined> {
     const bound = this.bind(sql, params);
-    return this.db.prepare(bound.sql).get(...(bound.params as never[])) as T | undefined;
+    return this.db.get<T>(bound.sql, bound.params);
   }
 
-  run(sql: string, ...params: unknown[]): void {
+  async run(sql: string, ...params: unknown[]): Promise<number> {
     const bound = this.bind(sql, params);
-    this.db.prepare(bound.sql).run(...(bound.params as never[]));
+    return this.db.run(bound.sql, bound.params);
   }
 
   /** Insert a row, forcing tenant_id. Throws if the row tries to set its own. */
-  insert(table: string, row: Record<string, unknown>): void {
+  async insert(table: string, row: Record<string, unknown>): Promise<void> {
     if ("tenant_id" in row) throw new Error("TenantScope.insert: do not set tenant_id yourself");
     const cols = ["tenant_id", ...Object.keys(row)];
     const placeholders = cols.map(() => "?").join(", ");
-    this.db
-      .prepare(`INSERT INTO ${table} (${cols.join(", ")}) VALUES (${placeholders})`)
-      .run(this.tenantId, ...(Object.values(row) as never[]));
+    await this.db.run(
+      `INSERT INTO ${table} (${cols.join(", ")}) VALUES (${placeholders})`,
+      [this.tenantId, ...Object.values(row)],
+    );
   }
 
   /** The tenant row itself. */
-  tenant<T = Record<string, unknown>>(): T {
-    const row = this.db.prepare("SELECT * FROM tenants WHERE tenant_id = ?").get(this.tenantId);
+  async tenant<T = Record<string, unknown>>(): Promise<T> {
+    const row = await this.db.get("SELECT * FROM tenants WHERE tenant_id = ?", [this.tenantId]);
     if (!row) throw new Error(`Unknown tenant ${this.tenantId}`);
     return row as T;
   }

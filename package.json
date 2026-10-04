@@ -9,6 +9,7 @@
   },
   "scripts": {
     "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.ts",
+    "test:pg": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 tests/*.test.ts",
     "seed": "node --disable-warning=ExperimentalWarning scripts/seed.ts",
     "check": "node --disable-warning=ExperimentalWarning --check src/tenant.ts",
     "build": "esbuild src/client/app.ts --bundle --format=esm --outfile=public/app.js --target=es2022 --log-level=warning",

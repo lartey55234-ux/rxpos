@@ -37,8 +37,9 @@ export class PostgresDatabase implements Database {
     return rows[0];
   }
 
-  async run(sql: string, params: unknown[] = []): Promise<void> {
-    await this.runner().query(toPgPlaceholders(sql), params);
+  async run(sql: string, params: unknown[] = []): Promise<number> {
+    const result = await this.runner().query(toPgPlaceholders(sql), params);
+    return result.rowCount ?? 0;
   }
 
   async exec(sql: string): Promise<void> {

@@ -9,27 +9,28 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { openMigratedDb } from "../src/db.ts";
+import { openMigratedDatabase } from "../src/storage/index.ts";
 import { seedPlans } from "../src/auth.ts";
 import { seedDemoPharmacy } from "../src/demo.ts";
 import { startServer } from "../src/server.ts";
 
 const config = loadConfig();
 
-if (config.databasePath !== ":memory:") {
-  mkdirSync(dirname(config.databasePath), { recursive: true });
+const isSqliteFile = !config.databaseUrl.startsWith("postgres") && config.databaseUrl !== ":memory:";
+if (isSqliteFile) {
+  mkdirSync(dirname(config.databaseUrl), { recursive: true });
 }
 
-const db = openMigratedDb(config.databasePath);
-seedPlans(db);
+const db = await openMigratedDatabase(config.databaseUrl);
+await seedPlans(db);
 
-const tenants = (db.prepare("SELECT COUNT(*) AS n FROM tenants").get() as { n: number }).n;
-const demo = config.seedDemo && tenants === 0 ? seedDemoPharmacy(db) : null;
+const tenants = (await db.get<{ n: number }>("SELECT COUNT(*) AS n FROM tenants"))?.n ?? 0;
+const demo = config.seedDemo && tenants === 0 ? await seedDemoPharmacy(db) : null;
 
 const server = await startServer(db, config.port, undefined, config.host);
 
 console.log(`[rxpos] listening on http://${config.host}:${config.port}`);
-console.log(`[rxpos] database  ${config.databasePath}`);
+console.log(`[rxpos] database  ${describeDatabase(config.databaseUrl)}`);
 if (demo) {
   console.log(`[rxpos] seeded the sample pharmacy — ${demo.credentials.owner} / ${demo.credentials.password}`);
 } else if (tenants > 0) {
@@ -42,11 +43,22 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
     if (closing) return;
     closing = true;
     console.log(`[rxpos] ${signal} received, closing`);
-    server.close(() => {
-      db.close();
+    server.close(async () => {
+      await db.close();
       process.exit(0);
     });
     // Do not let a hung connection block a redeploy.
     setTimeout(() => process.exit(0), 5000).unref();
   });
+}
+
+/** Never print a connection string: it carries the password. */
+function describeDatabase(url: string): string {
+  if (!url.startsWith("postgres")) return url;
+  try {
+    const parsed = new URL(url);
+    return `postgres ${parsed.host}${parsed.pathname}`;
+  } catch {
+    return "postgres";
+  }
 }

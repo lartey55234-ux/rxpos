@@ -10,8 +10,8 @@ export type AuditEntry = {
   after?: unknown;
 };
 
-export function writeAudit(scope: TenantScope, entry: AuditEntry): void {
-  scope.insert("audit_log", {
+export async function writeAudit(scope: TenantScope, entry: AuditEntry): Promise<void> {
+  await scope.insert("audit_log", {
     audit_id: newId("aud"),
     user_id: entry.userId,
     entity_type: entry.entityType,

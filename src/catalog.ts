@@ -23,21 +23,21 @@ export type ProductInput = {
   perishable?: boolean;
 };
 
-export function createCategory(actor: Actor, name: string, description?: string): string {
+export async function createCategory(actor: Actor, name: string, description?: string): Promise<string> {
   assertCan(actor.role, "products");
   const categoryId = newId("cat");
-  actor.scope.insert("categories", { category_id: categoryId, name, description: description ?? null });
+  await actor.scope.insert("categories", { category_id: categoryId, name, description: description ?? null });
   return categoryId;
 }
 
-export function createSupplier(
+export async function createSupplier(
   actor: Actor,
   input: { name: string; phone?: string | null; email?: string | null; address?: string | null },
-): string {
+): Promise<string> {
   assertCan(actor.role, "suppliers");
-  assertWithinPlan(actor.scope, "suppliers");
+  await assertWithinPlan(actor.scope, "suppliers");
   const supplierId = newId("sup");
-  actor.scope.insert("suppliers", {
+  await actor.scope.insert("suppliers", {
     supplier_id: supplierId,
     name: input.name,
     phone: input.phone ?? null,
@@ -45,7 +45,7 @@ export function createSupplier(
     address: input.address ?? null,
     created_at: nowIso(),
   });
-  writeAudit(actor.scope, {
+  await writeAudit(actor.scope, {
     userId: actor.userId,
     entityType: "supplier",
     entityId: supplierId,
@@ -55,11 +55,11 @@ export function createSupplier(
   return supplierId;
 }
 
-export function createProduct(actor: Actor, input: ProductInput): string {
+export async function createProduct(actor: Actor, input: ProductInput): Promise<string> {
   assertCan(actor.role, "products");
-  assertWithinPlan(actor.scope, "products");
+  await assertWithinPlan(actor.scope, "products");
   const productId = newId("prd");
-  actor.scope.insert("products", {
+  await actor.scope.insert("products", {
     product_id: productId,
     category_id: input.categoryId ?? null,
     name: input.name,
@@ -77,7 +77,7 @@ export function createProduct(actor: Actor, input: ProductInput): string {
     status: "active",
     created_at: nowIso(),
   });
-  writeAudit(actor.scope, {
+  await writeAudit(actor.scope, {
     userId: actor.userId,
     entityType: "product",
     entityId: productId,
@@ -87,14 +87,14 @@ export function createProduct(actor: Actor, input: ProductInput): string {
   return productId;
 }
 
-export function createBranch(
+export async function createBranch(
   actor: Actor,
   input: { name: string; address?: string | null; phone?: string | null },
-): string {
+): Promise<string> {
   assertCan(actor.role, "plans");
-  assertWithinPlan(actor.scope, "shops");
+  await assertWithinPlan(actor.scope, "shops");
   const branchId = newId("br");
-  actor.scope.insert("branches", {
+  await actor.scope.insert("branches", {
     branch_id: branchId,
     name: input.name,
     address: input.address ?? null,
@@ -119,11 +119,11 @@ export type ReceiveInput = {
  * Receive stock into a batch. Writes the batch, a stock movement for the ledger,
  * and — for a controlled product — the receipt side of the Controlled Drugs Register.
  */
-export function receiveBatch(actor: Actor, input: ReceiveInput): string {
+export async function receiveBatch(actor: Actor, input: ReceiveInput): Promise<string> {
   assertCan(actor.role, "stock");
   if (input.quantity <= 0) throw new Error("Quantity must be greater than zero");
 
-  const product = actor.scope.get<{
+  const product = await actor.scope.get<{
     product_id: string;
     name: string;
     perishable: number;
@@ -140,7 +140,7 @@ export function receiveBatch(actor: Actor, input: ReceiveInput): string {
   }
 
   const batchId = newId("bat");
-  actor.scope.insert("batches", {
+  await actor.scope.insert("batches", {
     batch_id: batchId,
     product_id: input.productId,
     branch_id: input.branchId,
@@ -153,7 +153,7 @@ export function receiveBatch(actor: Actor, input: ReceiveInput): string {
     received_at: nowIso(),
   });
 
-  actor.scope.insert("stock_movements", {
+  await actor.scope.insert("stock_movements", {
     movement_id: newId("mov"),
     batch_id: batchId,
     branch_id: input.branchId,
@@ -167,7 +167,7 @@ export function receiveBatch(actor: Actor, input: ReceiveInput): string {
   });
 
   if (product.controlled_class !== "none") {
-    recordControlledEntry(actor.scope, {
+    await recordControlledEntry(actor.scope, {
       branchId: input.branchId,
       direction: "received",
       productId: input.productId,
@@ -181,7 +181,7 @@ export function receiveBatch(actor: Actor, input: ReceiveInput): string {
     });
   }
 
-  writeAudit(actor.scope, {
+  await writeAudit(actor.scope, {
     userId: actor.userId,
     entityType: "batch",
     entityId: batchId,
@@ -192,8 +192,8 @@ export function receiveBatch(actor: Actor, input: ReceiveInput): string {
 }
 
 /** Sellable stock: excludes expired batches, which may not be supplied. */
-export function sellableStock(actor: Actor, productId: string, branchId: string): number {
-  const row = actor.scope.get<{ n: number }>(
+export async function sellableStock(actor: Actor, productId: string, branchId: string): Promise<number> {
+  const row = await actor.scope.get<{ n: number }>(
     `SELECT COALESCE(SUM(quantity), 0) AS n FROM batches
       WHERE tenant_id = {{tenant}} AND product_id = ? AND branch_id = ?
         AND quantity > 0 AND (expiry_date IS NULL OR expiry_date >= ?)`,
@@ -204,8 +204,8 @@ export function sellableStock(actor: Actor, productId: string, branchId: string)
   return row?.n ?? 0;
 }
 
-export function stockIncludingExpired(actor: Actor, productId: string, branchId: string): number {
-  const row = actor.scope.get<{ n: number }>(
+export async function stockIncludingExpired(actor: Actor, productId: string, branchId: string): Promise<number> {
+  const row = await actor.scope.get<{ n: number }>(
     "SELECT COALESCE(SUM(quantity), 0) AS n FROM batches WHERE tenant_id = {{tenant}} AND product_id = ? AND branch_id = ?",
     productId,
     branchId,
@@ -213,8 +213,8 @@ export function stockIncludingExpired(actor: Actor, productId: string, branchId:
   return row?.n ?? 0;
 }
 
-export function expiredBatches(actor: Actor, branchId: string) {
-  return actor.scope.all(
+export async function expiredBatches(actor: Actor, branchId: string) {
+  return await actor.scope.all(
     `SELECT b.batch_id, b.batch_number, b.expiry_date, b.quantity, p.name AS product
        FROM batches b JOIN products p ON p.product_id = b.product_id
       WHERE b.tenant_id = {{tenant}} AND b.branch_id = ? AND b.quantity > 0
@@ -225,9 +225,9 @@ export function expiredBatches(actor: Actor, branchId: string) {
   );
 }
 
-export function expiringWithin(actor: Actor, branchId: string, days: number) {
+export async function expiringWithin(actor: Actor, branchId: string, days: number) {
   const cutoff = new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
-  return actor.scope.all(
+  return await actor.scope.all(
     `SELECT b.batch_id, b.batch_number, b.expiry_date, b.quantity, p.name AS product
        FROM batches b JOIN products p ON p.product_id = b.product_id
       WHERE b.tenant_id = {{tenant}} AND b.branch_id = ? AND b.quantity > 0
@@ -239,8 +239,8 @@ export function expiringWithin(actor: Actor, branchId: string, days: number) {
   );
 }
 
-export function lowStock(actor: Actor, branchId: string) {
-  return actor.scope.all(
+export async function lowStock(actor: Actor, branchId: string) {
+  return await actor.scope.all(
     `SELECT p.product_id, p.name, p.reorder_level, COALESCE(SUM(b.quantity), 0) AS on_hand
        FROM products p
        LEFT JOIN batches b
@@ -248,17 +248,17 @@ export function lowStock(actor: Actor, branchId: string) {
         AND b.quantity > 0 AND (b.expiry_date IS NULL OR b.expiry_date >= ?)
       WHERE p.tenant_id = {{tenant}} AND p.status = 'active'
       GROUP BY p.product_id, p.name, p.reorder_level
-     HAVING on_hand <= p.reorder_level
-      ORDER BY on_hand ASC`,
+     HAVING COALESCE(SUM(b.quantity), 0) <= p.reorder_level
+      ORDER BY COALESCE(SUM(b.quantity), 0) ASC`,
     branchId,
     todayIso(),
   );
 }
 
 /** Write off a batch (expired or damaged). Never deletes: the movement stays. */
-export function writeOffBatch(actor: Actor, batchId: string, note: string): void {
+export async function writeOffBatch(actor: Actor, batchId: string, note: string): Promise<void> {
   assertCan(actor.role, "stock");
-  const batch = actor.scope.get<{
+  const batch = await actor.scope.get<{
     batch_id: string;
     branch_id: string;
     quantity: number;
@@ -270,8 +270,8 @@ export function writeOffBatch(actor: Actor, batchId: string, note: string): void
   if (!batch) throw new Error(`Unknown batch ${batchId}`);
   if (batch.quantity === 0) return;
 
-  actor.scope.run("UPDATE batches SET quantity = 0 WHERE tenant_id = {{tenant}} AND batch_id = ?", batchId);
-  actor.scope.insert("stock_movements", {
+  await actor.scope.run("UPDATE batches SET quantity = 0 WHERE tenant_id = {{tenant}} AND batch_id = ?", batchId);
+  await actor.scope.insert("stock_movements", {
     movement_id: newId("mov"),
     batch_id: batchId,
     branch_id: batch.branch_id,
@@ -283,7 +283,7 @@ export function writeOffBatch(actor: Actor, batchId: string, note: string): void
     note,
     created_at: nowIso(),
   });
-  writeAudit(actor.scope, {
+  await writeAudit(actor.scope, {
     userId: actor.userId,
     entityType: "batch",
     entityId: batchId,
@@ -313,9 +313,9 @@ export type ProductSearchRow = {
 };
 
 /** Counter search: what a salesperson sees as they type, with sellable stock. */
-export function searchProducts(actor: Actor, branchId: string, query = "", limit = 25): ProductSearchRow[] {
+export async function searchProducts(actor: Actor, branchId: string, query = "", limit = 25): Promise<ProductSearchRow[]> {
   const like = `%${query.trim().toLowerCase()}%`;
-  const rows = actor.scope.all<ProductSearchRow>(
+  const rows = await actor.scope.all<ProductSearchRow>(
     `SELECT p.product_id, p.name, p.brand, p.form, p.strength, c.name AS category, p.barcode,
             p.default_price_pesewas AS price_pesewas, p.reorder_level,
             p.cost_price_pesewas,
@@ -346,15 +346,15 @@ export function searchProducts(actor: Actor, branchId: string, query = "", limit
   return rows;
 }
 
-export function branchesFor(actor: Actor) {
-  return actor.scope.all<{ branch_id: string; name: string; address: string | null }>(
+export async function branchesFor(actor: Actor) {
+  return await actor.scope.all<{ branch_id: string; name: string; address: string | null }>(
     "SELECT branch_id, name, address FROM branches WHERE tenant_id = {{tenant}} ORDER BY created_at ASC",
   );
 }
 
 /** Guard: a branch id from the client must belong to the acting tenant. */
-export function assertBranch(actor: Actor, branchId: string): void {
-  const row = actor.scope.get<{ branch_id: string }>(
+export async function assertBranch(actor: Actor, branchId: string): Promise<void> {
+  const row = await actor.scope.get<{ branch_id: string }>(
     "SELECT branch_id FROM branches WHERE tenant_id = {{tenant}} AND branch_id = ?",
     branchId,
   );

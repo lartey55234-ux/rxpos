@@ -16,8 +16,8 @@ export interface Database {
   all<T = Row>(sql: string, params?: unknown[]): Promise<T[]>;
   /** SELECT one. */
   get<T = Row>(sql: string, params?: unknown[]): Promise<T | undefined>;
-  /** INSERT, UPDATE or DELETE. */
-  run(sql: string, params?: unknown[]): Promise<void>;
+  /** INSERT, UPDATE or DELETE. Resolves to the number of rows affected. */
+  run(sql: string, params?: unknown[]): Promise<number>;
   /** DDL, or several statements at once. */
   exec(sql: string): Promise<void>;
   /** Run fn inside a transaction. Rolls back if fn throws. */

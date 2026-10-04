@@ -16,11 +16,11 @@ export type PrescriptionInput = {
   issuedDate?: string;
 };
 
-export function createPrescription(actor: Actor, input: PrescriptionInput): string {
+export async function createPrescription(actor: Actor, input: PrescriptionInput): Promise<string> {
   assertCan(actor.role, "dispense_controlled");
   const issuedDate = input.issuedDate ?? todayIso();
   const prescriptionId = newId("rx");
-  actor.scope.insert("prescriptions", {
+  await actor.scope.insert("prescriptions", {
     prescription_id: prescriptionId,
     branch_id: input.branchId,
     prescription_number: input.prescriptionNumber,
@@ -33,7 +33,7 @@ export function createPrescription(actor: Actor, input: PrescriptionInput): stri
     created_by: actor.userId,
     created_at: nowIso(),
   });
-  writeAudit(actor.scope, {
+  await writeAudit(actor.scope, {
     userId: actor.userId,
     entityType: "prescription",
     entityId: prescriptionId,
@@ -51,7 +51,7 @@ export type PrescriptionRow = {
   retained_until: string;
 };
 
-export function getPrescription(actor: Actor, prescriptionId: string): PrescriptionRow | undefined {
+export async function getPrescription(actor: Actor, prescriptionId: string): Promise<PrescriptionRow | undefined> {
   return actor.scope.get<PrescriptionRow>(
     "SELECT prescription_id, patient_name, patient_address, prescriber_name, retained_until FROM prescriptions WHERE tenant_id = {{tenant}} AND prescription_id = ?",
     prescriptionId,

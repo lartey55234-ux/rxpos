@@ -21,9 +21,9 @@ type Row = {
  * Owner-only. Total, safe, at-risk and lost asset values are computed from
  * batches, because that is the number a pharmacy owner actually acts on.
  */
-export function assetValues(actor: Actor, branchId: string): AssetValues {
+export async function assetValues(actor: Actor, branchId: string): Promise<AssetValues> {
   assertCan(actor.role, "assets");
-  const rows = actor.scope.all<Row>(
+  const rows = await actor.scope.all<Row>(
     `SELECT b.quantity, b.expiry_date, p.perishable, b.selling_price_pesewas
        FROM batches b JOIN products p ON p.product_id = b.product_id
       WHERE b.tenant_id = {{tenant}} AND b.branch_id = ? AND b.quantity > 0`,
@@ -47,10 +47,10 @@ export function assetValues(actor: Actor, branchId: string): AssetValues {
   return out;
 }
 
-export function salesSummary(actor: Actor, branchId: string, days = 7) {
+export async function salesSummary(actor: Actor, branchId: string, days = 7) {
   assertCan(actor.role, "reports");
   const from = new Date(Date.now() - (days - 1) * 86_400_000).toISOString().slice(0, 10);
-  const row = actor.scope.get<{ revenue: number; cost: number; transactions: number }>(
+  const row = await actor.scope.get<{ revenue: number; cost: number; transactions: number }>(
     `SELECT COALESCE(SUM(si.line_total_pesewas), 0) AS revenue,
             COALESCE(SUM(si.quantity * b.cost_price_pesewas), 0) AS cost,
             COUNT(DISTINCT s.sale_id) AS transactions
@@ -72,10 +72,10 @@ export function salesSummary(actor: Actor, branchId: string, days = 7) {
   };
 }
 
-export function topProducts(actor: Actor, branchId: string, days = 7, limit = 5) {
+export async function topProducts(actor: Actor, branchId: string, days = 7, limit = 5) {
   assertCan(actor.role, "reports");
   const from = new Date(Date.now() - (days - 1) * 86_400_000).toISOString().slice(0, 10);
-  return actor.scope.all(
+  return await actor.scope.all(
     `SELECT p.name, SUM(si.quantity) AS units, SUM(si.line_total_pesewas) AS revenue_pesewas
        FROM sale_items si
        JOIN sales s ON s.sale_id = si.sale_id
@@ -89,9 +89,9 @@ export function topProducts(actor: Actor, branchId: string, days = 7, limit = 5)
   );
 }
 
-export function todayTotals(actor: Actor, branchId: string) {
+export async function todayTotals(actor: Actor, branchId: string) {
   assertCan(actor.role, "reports");
-  const row = actor.scope.get<{ revenue: number; transactions: number }>(
+  const row = await actor.scope.get<{ revenue: number; transactions: number }>(
     `SELECT COALESCE(SUM(total_pesewas), 0) AS revenue, COUNT(*) AS transactions
        FROM sales
       WHERE tenant_id = {{tenant}} AND branch_id = ? AND sale_date >= ?`,
