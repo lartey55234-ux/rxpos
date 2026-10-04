@@ -13,6 +13,8 @@ type Session = {
   tenant: { id: string; name: string; plan: { id: string; name: string; pricePesewas: number }; usage: Record<string, number> };
   branches: { branch_id: string; name: string; address: string | null }[];
   permissions: Record<string, boolean>;
+  /** False when the deployment has no payment keys. */
+  payments: { enabled: boolean };
 };
 
 type ProductRow = {
@@ -532,16 +534,119 @@ async function completeSale(): Promise<void> {
         prescriptionId,
       }),
     });
+
     cart = [];
     discountPesewas = 0;
     prescriptionId = null;
     prescriptionLabel = "";
     renderCart();
     void loadProducts();
+
+    // Card and mobile money are charged after the sale is rung up, so the stock is
+    // already reserved. If the charge does not settle, the sale stands with an
+    // unpaid tender and the cashier decides what to do about it.
+    if ((method === "Card" || method === "Mobile Money") && session?.payments?.enabled) {
+      const paid = await chargeForSale(result.receipt, method === "Card" ? "card" : "mobile_money");
+      if (!paid) {
+        toast("Rung up but not paid. Retry the charge, or take cash.", true);
+        return;
+      }
+    }
+
     showReceipt(result.receipt);
   } catch (err) {
     toast(err instanceof Error ? err.message : "The sale could not be completed", true);
   }
+}
+
+
+/**
+ * Take a card or mobile money payment.
+ *
+ * Deliberately does not load Paystack's script into this page: the customer pays
+ * on Paystack's own site, in another tab, and this page only ever talks to our own
+ * API. That keeps the content security policy intact — no third-party script runs
+ * with access to the counter — and it suits mobile money, which settles after the
+ * customer has put the phone down.
+ *
+ * Paystack is asked, never believed: the browser polling this endpoint cannot mark
+ * a sale paid, because the server does the verifying.
+ */
+async function chargeForSale(receipt: Receipt, channel: "card" | "mobile_money"): Promise<boolean> {
+  let charge: { reference: string; authorizationUrl: string; amountPesewas: number };
+  try {
+    const body = await api<{ charge: { reference: string; authorizationUrl: string; amountPesewas: number } }>(
+      "/api/payments/charge",
+      { method: "POST", body: JSON.stringify({ saleId: receipt.saleId, channel }) },
+    );
+    charge = body.charge;
+  } catch (err) {
+    toast(err instanceof Error ? err.message : "Could not start the charge", true);
+    return false;
+  }
+
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timer = 0;
+
+    const finish = (paid: boolean): void => {
+      if (settled) return;
+      settled = true;
+      window.clearInterval(timer);
+      closeModal();
+      resolve(paid);
+    };
+
+    openModal(`<h2>Take payment</h2>
+      <p style="color:var(--muted);font-size:13px;margin:-6px 0 14px">
+        <b>${money(charge.amountPesewas)}</b> by ${channel === "card" ? "card" : "mobile money"}.
+        Open Paystack to take the payment — this screen notices when it goes through.
+      </p>
+      <div class="foot" style="justify-content:space-between">
+        <button class="btn ghost" id="payCancel">Cancel</button>
+        <span style="display:flex;gap:8px">
+          <button class="btn" id="payCheck">Check payment</button>
+          <button class="btn primary" id="payOpen">Open Paystack</button>
+        </span>
+      </div>
+      <div class="note" id="payStatus">
+        <div id="payWait">Waiting for payment…</div>
+        <div style="font-size:11.5px;margin-top:4px">Reference <code>${esc(charge.reference)}</code> — quote this if the payment is disputed.</div>
+      </div>`);
+
+    // The reference stays put; only the waiting line changes.
+    const status = (): HTMLElement | null => document.getElementById("payWait");
+
+    const open = (): void => {
+      window.open(charge.authorizationUrl, "_blank", "noopener");
+    };
+
+    const check = async (): Promise<void> => {
+      if (settled) return;
+      try {
+        const body = await api<{ payment: { status: string; alreadyConfirmed: boolean } }>("/api/payments/confirm", {
+          method: "POST",
+          body: JSON.stringify({ reference: charge.reference }),
+        });
+        if (body.payment.status === "success" || body.payment.alreadyConfirmed) {
+          if (status()) status()!.textContent = "Paid.";
+          finish(true);
+          return;
+        }
+        if (status()) status()!.textContent = `Not paid yet — Paystack says "${body.payment.status}".`;
+      } catch (err) {
+        if (status()) status()!.textContent = err instanceof Error ? err.message : "Could not check the payment";
+      }
+    };
+
+    byId("payOpen").addEventListener("click", open);
+    byId("payCheck").addEventListener("click", () => void check());
+    byId("payCancel").addEventListener("click", () => finish(false));
+
+    open();
+    void check();
+    timer = window.setInterval(() => void check(), 5000);
+  });
 }
 
 function receiptHTML(receipt: Receipt): string {

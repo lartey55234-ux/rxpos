@@ -25,6 +25,8 @@ import { newId, nowIso } from "./util.ts";
 export type Charge = {
   reference: string;
   accessCode: string;
+  /** Where the customer pays. Paystack's own page, not ours. */
+  authorizationUrl: string;
   amountPesewas: number;
   channel: Channel;
 };
@@ -77,6 +79,7 @@ export async function startCharge(
     return {
       reference: existing.reference,
       accessCode: again.accessCode,
+      authorizationUrl: again.authorizationUrl,
       amountPesewas: existing.amount_pesewas,
       channel: input.channel,
     };
@@ -108,6 +111,7 @@ export async function startCharge(
   return {
     reference: initialised.reference,
     accessCode: initialised.accessCode,
+    authorizationUrl: initialised.authorizationUrl,
     amountPesewas: sale.total_pesewas,
     channel: input.channel,
   };

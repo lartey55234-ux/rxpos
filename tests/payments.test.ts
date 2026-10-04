@@ -6,7 +6,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import type { Server } from "node:http";
-import { freshTestDatabase, newPharmacy, seedBatch, seedProduct } from "../src/testing.ts";
+import { randomBytes } from "node:crypto";
+import { freshTestDatabase, seedBatch, seedProduct } from "../src/testing.ts";
+import { authenticate, registerPharmacy } from "../src/auth.ts";
 import { startServer } from "../src/server.ts";
 import { createSale } from "../src/sales.ts";
 import { confirmCharge, paymentState, startCharge } from "../src/checkout.ts";
@@ -25,16 +27,42 @@ const server: Server = await startServer(db, 0, undefined, "127.0.0.1", {
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 test.after(() => server.close());
 
+const runId = randomBytes(4).toString("hex");
+let counter = 0;
+
+/**
+ * A pharmacy on the *same* database the server is using. newPharmacy() makes its
+ * own database, which is right for the domain tests but would leave the server
+ * unable to see this pharmacy's charges.
+ */
 async function signedIn() {
-  const f = await newPharmacy("pro", "pay");
-  const product = await seedProduct(f.owner, { name: "Amoxicillin", pricePesewas: 1500, costPesewas: 800 });
-  await seedBatch(f.owner, f.branchId, product, { batchNumber: "AM1", expiryDate: addDays(todayIso(), 200), quantity: 20 });
-  const sale = await createSale(f.owner, {
-    branchId: f.branchId,
+  counter += 1;
+  const email = `pay${counter}.${runId}@example.com`;
+  const reg = await registerPharmacy(db, {
+    pharmacyName: `Payments ${counter}`,
+    ownerName: "Test Owner",
+    email,
+    password: "secret123",
+    planId: "pro",
+  });
+  const owner = await authenticate(db, reg.token);
+  const product = await seedProduct(owner, { name: "Amoxicillin", pricePesewas: 1500, costPesewas: 800 });
+  await seedBatch(owner, reg.branchId, product, { batchNumber: "AM1", expiryDate: addDays(todayIso(), 200), quantity: 20 });
+  const sale = await createSale(owner, {
+    branchId: reg.branchId,
     lines: [{ productId: product, quantity: 2 }],
     paymentMethod: "Mobile Money",
   });
-  return { ...f, sale, product };
+  return {
+    db,
+    owner,
+    token: reg.token,
+    tenantId: reg.tenantId,
+    branchId: reg.branchId,
+    email,
+    sale,
+    product,
+  };
 }
 
 test("a charge takes its amount from the sale, not from the caller", async () => {
@@ -175,6 +203,7 @@ test("the charge route goes through HTTP with the amount from the sale", async (
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ email: f.email, password: "secret123" }),
   });
+  assert.equal(login.status, 200, "the pharmacy can sign in on the server's database");
   const { token } = (await login.json()) as { token: string };
 
   const res = await fetch(`${base}/api/payments/charge`, {
