@@ -16,6 +16,10 @@
     "start": "node --disable-warning=ExperimentalWarning scripts/serve.ts"
   },
   "devDependencies": {
+    "@types/pg": "^8.23.1",
     "esbuild": "^0.28.2"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
   }
 }
