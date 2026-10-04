@@ -10,3 +10,7 @@ shot-*.png
 create_*.json
 update_*.json
 fix_*.json
+
+# Private keys for the server. The public halves are in the README and on GitHub.
+deploy/agent_key
+deploy/deploy_key
