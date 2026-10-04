@@ -296,11 +296,14 @@ export function writeOffBatch(actor: Actor, batchId: string, note: string): void
 export type ProductSearchRow = {
   product_id: string;
   name: string;
+  brand: string | null;
   form: string | null;
   strength: string | null;
   category: string | null;
   barcode: string | null;
   price_pesewas: number;
+  /** Present only for a caller allowed to see what the pharmacy paid. */
+  cost_price_pesewas?: number;
   reorder_level: number;
   prescription_required: number;
   controlled_class: ControlledClass;
@@ -313,8 +316,9 @@ export type ProductSearchRow = {
 export function searchProducts(actor: Actor, branchId: string, query = "", limit = 25): ProductSearchRow[] {
   const like = `%${query.trim().toLowerCase()}%`;
   const rows = actor.scope.all<ProductSearchRow>(
-    `SELECT p.product_id, p.name, p.form, p.strength, c.name AS category, p.barcode,
+    `SELECT p.product_id, p.name, p.brand, p.form, p.strength, c.name AS category, p.barcode,
             p.default_price_pesewas AS price_pesewas, p.reorder_level,
+            p.cost_price_pesewas,
             p.prescription_required, p.controlled_class,
             COALESCE((SELECT SUM(b.quantity) FROM batches b
                        WHERE b.tenant_id = p.tenant_id AND b.product_id = p.product_id AND b.branch_id = ?

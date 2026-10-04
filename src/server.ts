@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Db } from "./db.ts";
-import { AuthError, authenticate, login, registerPharmacy, seedPlans } from "./auth.ts";
+import { AuthError, addStaff, authenticate, login, registerPharmacy, seedPlans } from "./auth.ts";
 import { RateLimitError, RateLimiter } from "./ratelimit.ts";
 import { PermissionError, can, type Permission, type Role } from "./permissions.ts";
 import { PlanLimitError, planFor, usageFor } from "./plans.ts";
@@ -13,6 +13,8 @@ import { readRegister } from "./controlled.ts";
 import {
   assertBranch,
   branchesFor,
+  createBranch,
+  createCategory,
   createProduct,
   createSupplier,
   expiredBatches,
@@ -20,6 +22,7 @@ import {
   lowStock,
   receiveBatch,
   searchProducts,
+  writeOffBatch,
 } from "./catalog.ts";
 import { assetValues, salesSummary, todayTotals, topProducts } from "./reports.ts";
 import { ValidationError } from "./util.ts";
@@ -60,6 +63,16 @@ function clientKey(req: IncomingMessage): string {
   const forwarded = req.headers["x-forwarded-for"];
   const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(",")[0]?.trim();
   return first || req.socket.remoteAddress || "unknown";
+}
+
+/** Body values arrive as unknown; these two keep the routes readable. */
+function str(value: unknown): string {
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function optional(value: unknown): string | null {
+  const text = str(value).trim();
+  return text === "" ? null : text;
 }
 
 const PERMISSIONS: Permission[] = [
@@ -209,7 +222,13 @@ export function createRequestHandler(
         const me = actor();
         const branchId = String(url.searchParams.get("branchId") ?? "");
         assertBranch(me, branchId);
-        send(res, 200, { products: searchProducts(me, branchId, url.searchParams.get("q") ?? "") });
+        const products = searchProducts(me, branchId, url.searchParams.get("q") ?? "");
+        // Cost price is what the pharmacy paid for the stock, so it follows the
+        // same rule as asset values: the owner sees it and nobody else does.
+        if (!can(me.role, "assets")) {
+          for (const product of products) delete product.cost_price_pesewas;
+        }
+        send(res, 200, { products });
         return;
       }
 
@@ -290,12 +309,14 @@ export function createRequestHandler(
         const me = actor();
         const body = await readJson(req);
         const batchId = receiveBatch(me, {
-          branchId: String(body.branchId ?? ""),
-          productId: String(body.productId ?? ""),
-          batchNumber: String(body.batchNumber ?? ""),
-          expiryDate: body.expiryDate ? String(body.expiryDate) : null,
+          branchId: str(body.branchId),
+          productId: str(body.productId),
+          batchNumber: str(body.batchNumber),
+          expiryDate: optional(body.expiryDate),
           quantity: Number(body.quantity ?? 0),
-          supplierId: body.supplierId ? String(body.supplierId) : null,
+          costPricePesewas: body.costPricePesewas === undefined ? undefined : Number(body.costPricePesewas),
+          sellingPricePesewas: body.sellingPricePesewas === undefined ? undefined : Number(body.sellingPricePesewas),
+          supplierId: optional(body.supplierId),
         });
         send(res, 201, { batchId });
         return;
@@ -305,11 +326,15 @@ export function createRequestHandler(
         const me = actor();
         const body = await readJson(req);
         const productId = createProduct(me, {
-          name: String(body.name ?? ""),
-          form: body.form ? String(body.form) : null,
-          strength: body.strength ? String(body.strength) : null,
-          barcode: body.barcode ? String(body.barcode) : null,
+          name: str(body.name),
+          categoryId: optional(body.categoryId),
+          brand: optional(body.brand),
+          form: optional(body.form),
+          strength: optional(body.strength),
+          unit: optional(body.unit),
+          barcode: optional(body.barcode),
           defaultPricePesewas: Number(body.pricePesewas ?? 0),
+          costPricePesewas: Number(body.costPricePesewas ?? 0),
           reorderLevel: body.reorderLevel === undefined ? 0 : Number(body.reorderLevel),
           prescriptionRequired: Boolean(body.prescriptionRequired),
           controlledClass: (body.controlledClass as "none" | "B" | "A") ?? "none",
@@ -322,7 +347,96 @@ export function createRequestHandler(
       if (method === "POST" && path === "/api/suppliers") {
         const me = actor();
         const body = await readJson(req);
-        send(res, 201, { supplierId: createSupplier(me, { name: String(body.name ?? "") }) });
+        send(res, 201, {
+          supplierId: createSupplier(me, {
+            name: str(body.name),
+            phone: optional(body.phone),
+            email: optional(body.email),
+            address: optional(body.address),
+          }),
+        });
+        return;
+      }
+
+      /* ------------------- setting a pharmacy up, after signup ------------------ */
+
+      if (method === "GET" && path === "/api/suppliers") {
+        const me = actor();
+        send(res, 200, {
+          suppliers: me.scope.all(
+            "SELECT supplier_id, name, phone, email, address FROM suppliers WHERE tenant_id = {{tenant}} ORDER BY name",
+          ),
+        });
+        return;
+      }
+
+      if (method === "GET" && path === "/api/categories") {
+        const me = actor();
+        send(res, 200, {
+          categories: me.scope.all(
+            "SELECT category_id, name, description FROM categories WHERE tenant_id = {{tenant}} ORDER BY name",
+          ),
+        });
+        return;
+      }
+
+      if (method === "POST" && path === "/api/categories") {
+        const me = actor();
+        const body = await readJson(req);
+        send(res, 201, {
+          categoryId: createCategory(me, str(body.name), optional(body.description) ?? undefined),
+        });
+        return;
+      }
+
+      // Branches change what the plan charges for, so the domain gates this on "plans".
+      if (method === "POST" && path === "/api/branches") {
+        const me = actor();
+        const body = await readJson(req);
+        const branchId = createBranch(me, {
+          name: str(body.name),
+          address: optional(body.address),
+          phone: optional(body.phone),
+        });
+        send(res, 201, { branchId, branches: branchesFor(me) });
+        return;
+      }
+
+      if (method === "GET" && path === "/api/staff") {
+        const me = actor();
+        if (!can(me.role, "users")) throw new PermissionError("Only the owner can see staff accounts");
+        send(res, 200, {
+          staff: me.scope.all(
+            "SELECT user_id, name, email, role, status, branch_id, created_at FROM users WHERE tenant_id = {{tenant}} ORDER BY created_at",
+          ),
+        });
+        return;
+      }
+
+      if (method === "POST" && path === "/api/staff") {
+        const me = actor();
+        const body = await readJson(req);
+        const role = str(body.role) || "salesperson";
+        if (role !== "admin" && role !== "salesperson") {
+          throw new ValidationError("Role must be admin or salesperson");
+        }
+        const userId = addStaff(db, me, {
+          name: str(body.name),
+          email: str(body.email),
+          password: str(body.password),
+          role,
+          branchId: optional(body.branchId),
+        });
+        send(res, 201, { userId });
+        return;
+      }
+
+      const writeOffMatch = /^\/api\/batches\/([^/]+)\/writeoff$/.exec(path);
+      if (method === "POST" && writeOffMatch) {
+        const me = actor();
+        const body = await readJson(req);
+        writeOffBatch(me, writeOffMatch[1], str(body.note) || "Written off");
+        send(res, 200, { ok: true });
         return;
       }
 
