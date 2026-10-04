@@ -223,7 +223,9 @@ export function createRequestHandler(
         const me = await actor();
         const branchId = String(url.searchParams.get("branchId") ?? "");
         await assertBranch(me, branchId);
-        const products = await searchProducts(me, branchId, url.searchParams.get("q") ?? "");
+        const limit = Number(url.searchParams.get("limit") ?? 25);
+        const products = await searchProducts(me, branchId, url.searchParams.get("q") ?? "",
+          Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 500) : 25);
         // Cost price is what the pharmacy paid for the stock, so it follows the
         // same rule as asset values: the owner sees it and nobody else does.
         if (!can(me.role, "assets")) {

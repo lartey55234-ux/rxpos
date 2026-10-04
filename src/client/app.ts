@@ -18,6 +18,9 @@ type Session = {
 type ProductRow = {
   product_id: string;
   name: string;
+  brand: string | null;
+  /** Only sent to a caller allowed to see what the pharmacy paid. */
+  cost_price_pesewas?: number;
   form: string | null;
   strength: string | null;
   barcode: string | null;
@@ -206,6 +209,9 @@ function renderApp(): void {
   const tabs = [
     { id: "counter", label: "Counter" },
     { id: "stock", label: "Stock" },
+    ...(session.permissions.products ? [{ id: "products", label: "Products" }] : []),
+    ...(session.permissions.suppliers ? [{ id: "suppliers", label: "Suppliers" }] : []),
+    ...(session.permissions.users ? [{ id: "team", label: "Team" }] : []),
     { id: "alerts", label: "Alerts" },
     ...(session.permissions.reports ? [{ id: "register", label: "Register" }] : []),
     ...(session.permissions.reports ? [{ id: "reports", label: "Reports" }] : []),
@@ -249,6 +255,9 @@ function renderApp(): void {
 function renderView(): void {
   if (view === "counter") renderCounter();
   else if (view === "stock") renderStock();
+  else if (view === "products") void renderProducts();
+  else if (view === "suppliers") void renderSuppliers();
+  else if (view === "team") void renderTeam();
   else if (view === "alerts") renderAlerts();
   else if (view === "register") renderRegister();
   else renderReports();
@@ -580,7 +589,7 @@ async function loadStock(filter: string): Promise<void> {
       box.innerHTML = `<div class="empty">Nothing matches that filter.</div>`;
       return;
     }
-    box.innerHTML = `<table><thead><tr><th>Product</th><th>Barcode</th><th class="num">Sellable</th><th class="num">On hand</th><th>Nearest expiry</th><th class="num">Price</th></tr></thead><tbody>
+    box.innerHTML = `<table><thead><tr><th>Product</th><th>Barcode</th><th class="num">Sellable</th><th class="num">On hand</th><th>Nearest expiry</th><th class="num">Price</th><th></th></tr></thead><tbody>
       ${data.products
         .map((p) => {
           const status =
@@ -596,10 +605,16 @@ async function loadStock(filter: string): Promise<void> {
             <td class="num">${p.on_hand}${p.on_hand !== p.sellable ? `<br><span style="font-size:11px;color:var(--muted)">+${p.on_hand - p.sellable} expired</span>` : ""}</td>
             <td>${p.nearest_expiry ? esc(p.nearest_expiry) : `<span class="badge b-mute">non-perishable</span>`}</td>
             <td class="num">${money(p.price_pesewas)}</td>
+            <td class="num">${session?.permissions.stock ? `<button class="btn sm ghost" data-receive="${p.product_id}" data-name="${esc(p.name)}">Receive</button>` : ""}</td>
           </tr>`;
         })
         .join("")}
     </tbody></table>`;
+    box.querySelectorAll("[data-receive]").forEach((btn) =>
+      btn.addEventListener("click", () =>
+        void receiveModal(btn.getAttribute("data-receive") ?? "", btn.getAttribute("data-name") ?? ""),
+      ),
+    );
   } catch (err) {
     box.innerHTML = `<div class="empty">${esc(err instanceof Error ? err.message : "Could not load stock")}</div>`;
   }
@@ -779,6 +794,404 @@ document.addEventListener("click", (event) => {
 document.addEventListener("keydown", (event) => {
   if ((event as KeyboardEvent).key === "Escape") closeModal();
 });
+
+/* ------------------------------- catalogue ------------------------------ */
+
+const PRODUCT_FORMS = ["Tablets", "Capsules", "Syrup", "Suspension", "Injection", "Sachet", "Cream", "Ointment", "Drops", "Inhaler", "Device", "Other"];
+
+/** The API counts in pesewas; a person types cedis. */
+function toPesewas(value: string): number {
+  const amount = Number(value);
+  return Number.isFinite(amount) && amount > 0 ? Math.round(amount * 100) : 0;
+}
+
+const fld = (label: string, control: string): string => `<div class="fld"><label>${label}</label>${control}</div>`;
+
+const flagsFor = (p: ProductRow): string =>
+  p.controlled_class !== "none"
+    ? ` <span class="badge b-exp">Class ${p.controlled_class}</span>`
+    : p.prescription_required
+      ? ` <span class="badge b-rx">Rx</span>`
+      : "";
+
+/* ---- products ---- */
+
+async function renderProducts(): Promise<void> {
+  byId("main").innerHTML = `<section class="card">
+    <h2>Products <span class="badge b-mute">${esc(branchName())}</span>
+      <button class="btn sm primary" id="addProduct">Add product</button></h2>
+    <div class="scanrow"><input id="productSearch" placeholder="Filter by name, barcode or brand" autocomplete="off"></div>
+    <div id="productTable"><div class="empty">Loading…</div></div>
+    <div class="note">Stock is counted per batch, not per product. A product with no batch has no stock — use <b>Receive stock</b> to add some.</div>
+  </section>`;
+  const search = byId<HTMLInputElement>("productSearch");
+  search.addEventListener("input", debounce(() => void loadCatalogue(search.value), 160));
+  byId("addProduct").addEventListener("click", () => void productModal());
+  await loadCatalogue("");
+}
+
+async function loadCatalogue(filter: string): Promise<void> {
+  const box = document.getElementById("productTable");
+  if (!box) return;
+  const showCost = session?.permissions.assets ?? false;
+  try {
+    const data = await api<{ products: ProductRow[] }>(
+      `/api/products?branchId=${encodeURIComponent(branchId)}&q=${encodeURIComponent(filter)}&limit=200`,
+    );
+    if (!data.products.length) {
+      box.innerHTML = `<div class="empty">${filter ? "Nothing matches that filter." : "No products yet. Add the first one."}</div>`;
+      return;
+    }
+    box.innerHTML = `<table><thead><tr>
+        <th>Product</th><th>Barcode</th><th class="num">Price</th>${showCost ? `<th class="num">Cost</th>` : ""}
+        <th class="num">On hand</th><th class="num">Reorder</th><th></th></tr></thead><tbody>
+      ${data.products
+        .map((p) => {
+          const detail = [p.brand, p.form, p.strength].filter(Boolean).join(" · ");
+          return `<tr>
+            <td><b>${esc(p.name)}</b>${flagsFor(p)}<br><span style="font-size:11.5px;color:var(--muted)">${esc(detail || "—")}</span></td>
+            <td>${esc(p.barcode ?? "—")}</td>
+            <td class="num">${money(p.price_pesewas)}</td>
+            ${showCost ? `<td class="num">${p.cost_price_pesewas ? money(p.cost_price_pesewas) : "—"}</td>` : ""}
+            <td class="num">${p.on_hand}</td>
+            <td class="num">${p.reorder_level || "—"}</td>
+            <td class="num"><button class="btn sm ghost" data-receive="${p.product_id}" data-name="${esc(p.name)}">Receive stock</button></td>
+          </tr>`;
+        })
+        .join("")}
+    </tbody></table>`;
+    box.querySelectorAll("[data-receive]").forEach((btn) =>
+      btn.addEventListener("click", () =>
+        void receiveModal(btn.getAttribute("data-receive") ?? "", btn.getAttribute("data-name") ?? ""),
+      ),
+    );
+  } catch (err) {
+    box.innerHTML = `<div class="empty">${esc(err instanceof Error ? err.message : "Could not load products")}</div>`;
+  }
+}
+
+async function productModal(): Promise<void> {
+  let categories: { category_id: string; name: string }[] = [];
+  try {
+    categories = (await api<{ categories: { category_id: string; name: string }[] }>("/api/categories")).categories;
+  } catch {
+    /* a brand new pharmacy has none yet */
+  }
+
+  openModal(`<h2>Add a product</h2>
+    <div class="inline">
+      ${fld("Name", `<input id="pName" placeholder="Paracetamol">`)}
+      ${fld("Brand", `<input id="pBrand" placeholder="Kinapharma">`)}
+      ${fld("Form", `<select id="pForm">${PRODUCT_FORMS.map((f) => `<option>${f}</option>`).join("")}</select>`)}
+      ${fld("Strength", `<input id="pStrength" placeholder="500 mg">`)}
+      ${fld("Unit", `<input id="pUnit" placeholder="Blister of 10">`)}
+      ${fld("Barcode", `<input id="pBarcode" placeholder="PCM500">`)}
+      ${fld("Category", `<input id="pCategory" list="catList" placeholder="Analgesics"><datalist id="catList">${categories
+        .map((c) => `<option value="${esc(c.name)}"></option>`)
+        .join("")}</datalist>`)}
+      ${fld("Reorder level", `<input id="pReorder" type="number" min="0" placeholder="40">`)}
+      ${fld("Selling price (GHS)", `<input id="pPrice" type="number" step="0.01" min="0" placeholder="5.00">`)}
+      ${fld("Cost price (GHS)", `<input id="pCost" type="number" step="0.01" min="0" placeholder="2.50">`)}
+      ${fld("Controlled drug", `<select id="pControlled"><option value="none">Not controlled</option><option value="B">Class B</option><option value="A">Class A</option></select>`)}
+      ${fld("Rules", `<label style="display:flex;gap:8px;align-items:center;font-size:13px;text-transform:none;letter-spacing:0;color:var(--ink)"><input id="pRx" type="checkbox" style="width:auto"> Prescription only</label>
+        <label style="display:flex;gap:8px;align-items:center;font-size:13px;text-transform:none;letter-spacing:0;color:var(--ink)"><input id="pPerishable" type="checkbox" checked style="width:auto"> Has an expiry date</label>`)}
+    </div>
+    <div class="foot">
+      <button class="btn ghost" id="cancel">Cancel</button>
+      <button class="btn primary" id="save">Add product</button>
+    </div>`);
+
+  byId("cancel").addEventListener("click", closeModal);
+  byId("save").addEventListener("click", async () => {
+    const name = (byId("pName") as HTMLInputElement).value.trim();
+    if (!name) {
+      toast("Give the product a name", true);
+      return;
+    }
+    const typed = (byId("pCategory") as HTMLInputElement).value.trim();
+    try {
+      let categoryId: string | null = null;
+      if (typed) {
+        const existing = categories.find((c) => c.name.toLowerCase() === typed.toLowerCase());
+        categoryId = existing
+          ? existing.category_id
+          : (await api<{ categoryId: string }>("/api/categories", {
+              method: "POST",
+              body: JSON.stringify({ name: typed }),
+            })).categoryId;
+      }
+      await api("/api/products", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          brand: (byId("pBrand") as HTMLInputElement).value,
+          form: (byId("pForm") as HTMLSelectElement).value,
+          strength: (byId("pStrength") as HTMLInputElement).value,
+          unit: (byId("pUnit") as HTMLInputElement).value,
+          barcode: (byId("pBarcode") as HTMLInputElement).value,
+          categoryId,
+          pricePesewas: toPesewas((byId("pPrice") as HTMLInputElement).value),
+          costPricePesewas: toPesewas((byId("pCost") as HTMLInputElement).value),
+          reorderLevel: Number((byId("pReorder") as HTMLInputElement).value || 0),
+          prescriptionRequired: (byId("pRx") as HTMLInputElement).checked,
+          controlledClass: (byId("pControlled") as HTMLSelectElement).value,
+          perishable: (byId("pPerishable") as HTMLInputElement).checked,
+        }),
+      });
+      closeModal();
+      toast(`${name} added`);
+      await loadCatalogue((document.getElementById("productSearch") as HTMLInputElement | null)?.value ?? "");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not add the product", true);
+    }
+  });
+}
+
+/* ---- receiving stock ---- */
+
+async function receiveModal(productId: string, productName: string): Promise<void> {
+  if (!productId) return;
+  let suppliers: { supplier_id: string; name: string }[] = [];
+  try {
+    suppliers = (await api<{ suppliers: { supplier_id: string; name: string }[] }>("/api/suppliers")).suppliers;
+  } catch {
+    /* none yet, or no permission */
+  }
+
+  openModal(`<h2>Receive stock</h2>
+    <p style="color:var(--muted);font-size:13px;margin:-6px 0 14px">${esc(productName)} into ${esc(branchName())}.</p>
+    <div class="inline">
+      ${fld("Batch number", `<input id="bNumber" placeholder="PCM-26A">`)}
+      ${fld("Expiry date", `<input id="bExpiry" type="date">`)}
+      ${fld("Quantity", `<input id="bQty" type="number" min="1" placeholder="240">`)}
+      ${fld("Supplier", `<select id="bSupplier"><option value="">— none —</option>${suppliers
+        .map((s) => `<option value="${s.supplier_id}">${esc(s.name)}</option>`)
+        .join("")}</select>`)}
+      ${fld("Cost price (GHS)", `<input id="bCost" type="number" step="0.01" min="0" placeholder="leave blank to use the product's">`)}
+      ${fld("Selling price (GHS)", `<input id="bPrice" type="number" step="0.01" min="0" placeholder="leave blank to use the product's">`)}
+    </div>
+    <div class="foot">
+      <button class="btn ghost" id="cancel">Cancel</button>
+      <button class="btn primary" id="save">Receive stock</button>
+    </div>`);
+
+  byId("cancel").addEventListener("click", closeModal);
+  byId("save").addEventListener("click", async () => {
+    const quantity = Number((byId("bQty") as HTMLInputElement).value || 0);
+    const batchNumber = (byId("bNumber") as HTMLInputElement).value.trim();
+    if (!batchNumber) {
+      toast("Give the batch a number", true);
+      return;
+    }
+    if (quantity <= 0) {
+      toast("Quantity must be more than zero", true);
+      return;
+    }
+    const cost = (byId("bCost") as HTMLInputElement).value;
+    const price = (byId("bPrice") as HTMLInputElement).value;
+    try {
+      await api("/api/batches", {
+        method: "POST",
+        body: JSON.stringify({
+          branchId,
+          productId,
+          batchNumber,
+          expiryDate: (byId("bExpiry") as HTMLInputElement).value || null,
+          quantity,
+          supplierId: (byId("bSupplier") as HTMLSelectElement).value || null,
+          ...(cost ? { costPricePesewas: toPesewas(cost) } : {}),
+          ...(price ? { sellingPricePesewas: toPesewas(price) } : {}),
+        }),
+      });
+      closeModal();
+      toast(`${quantity} received`);
+      if (view === "products") await loadCatalogue((document.getElementById("productSearch") as HTMLInputElement | null)?.value ?? "");
+      else if (view === "stock") await loadStock((document.getElementById("stockSearch") as HTMLInputElement | null)?.value ?? "");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not receive the stock", true);
+    }
+  });
+}
+
+/* ---- suppliers ---- */
+
+async function renderSuppliers(): Promise<void> {
+  byId("main").innerHTML = `<section class="card">
+    <h2>Add a supplier</h2>
+    <div class="inline">
+      ${fld("Name", `<input id="sName" placeholder="Ernest Chemists Ltd">`)}
+      ${fld("Phone", `<input id="sPhone" placeholder="+233 30 222 0000">`)}
+      ${fld("Email", `<input id="sEmail" type="email">`)}
+      ${fld("Address", `<input id="sAddress">`)}
+    </div>
+    <div class="foot"><button class="btn primary" id="saveSupplier">Add supplier</button></div>
+  </section>
+  <section class="card" style="margin-top:16px">
+    <h2>Suppliers</h2>
+    <div id="supplierList"><div class="empty">Loading…</div></div>
+  </section>`;
+
+  byId("saveSupplier").addEventListener("click", async () => {
+    const name = (byId("sName") as HTMLInputElement).value.trim();
+    if (!name) {
+      toast("Give the supplier a name", true);
+      return;
+    }
+    try {
+      await api("/api/suppliers", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          phone: (byId("sPhone") as HTMLInputElement).value,
+          email: (byId("sEmail") as HTMLInputElement).value,
+          address: (byId("sAddress") as HTMLInputElement).value,
+        }),
+      });
+      toast(`${name} added`);
+      renderSuppliers();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not add the supplier", true);
+    }
+  });
+
+  await loadSuppliers();
+}
+
+async function loadSuppliers(): Promise<void> {
+  const box = document.getElementById("supplierList");
+  if (!box) return;
+  try {
+    const data = await api<{ suppliers: { supplier_id: string; name: string; phone: string | null; email: string | null; address: string | null }[] }>("/api/suppliers");
+    if (!data.suppliers.length) {
+      box.innerHTML = `<div class="empty">No suppliers yet.</div>`;
+      return;
+    }
+    box.innerHTML = `<table><thead><tr><th>Supplier</th><th>Phone</th><th>Email</th><th>Address</th></tr></thead><tbody>
+      ${data.suppliers
+        .map(
+          (s) => `<tr><td><b>${esc(s.name)}</b></td><td>${esc(s.phone ?? "—")}</td><td>${esc(s.email ?? "—")}</td><td>${esc(s.address ?? "—")}</td></tr>`,
+        )
+        .join("")}
+    </tbody></table>`;
+  } catch (err) {
+    box.innerHTML = `<div class="empty">${esc(err instanceof Error ? err.message : "Could not load suppliers")}</div>`;
+  }
+}
+
+/* ---- staff and branches ---- */
+
+async function renderTeam(): Promise<void> {
+  byId("main").innerHTML = `<section class="card">
+    <h2>Add someone to the team</h2>
+    <div class="inline">
+      ${fld("Name", `<input id="uName" placeholder="Ama Boateng">`)}
+      ${fld("Email", `<input id="uEmail" type="email" placeholder="ama@pharmacy.com">`)}
+      ${fld("Password", `<input id="uPassword" type="text" placeholder="at least 8 characters">`)}
+      ${fld("Role", `<select id="uRole"><option value="salesperson">Salesperson — sells only</option><option value="admin">Administrator — stock, products, sales, reports</option></select>`)}
+      ${fld("Branch", `<select id="uBranch"><option value="">All branches</option>${(session?.branches ?? [])
+        .map((b) => `<option value="${b.branch_id}"${b.branch_id === branchId ? " selected" : ""}>${esc(b.name)}</option>`)
+        .join("")}</select>`)}
+    </div>
+    <div class="foot"><button class="btn primary" id="saveStaff">Add account</button></div>
+  </section>
+
+  <section class="card" style="margin-top:16px">
+    <h2>Team</h2>
+    <div id="staffList"><div class="empty">Loading…</div></div>
+  </section>
+
+  <section class="card" style="margin-top:16px">
+    <h2>Branches</h2>
+    <div class="inline">
+      ${fld("Name", `<input id="brName" placeholder="Adabraka Branch">`)}
+      ${fld("Address", `<input id="brAddress" placeholder="Adabraka, Accra">`)}
+    </div>
+    <div class="foot"><button class="btn primary" id="saveBranch">Add branch</button></div>
+    <div id="branchList" style="margin-top:12px"></div>
+  </section>`;
+
+  byId("saveStaff").addEventListener("click", async () => {
+    const name = (byId("uName") as HTMLInputElement).value.trim();
+    const email = (byId("uEmail") as HTMLInputElement).value.trim();
+    const password = (byId("uPassword") as HTMLInputElement).value;
+    if (!name || !email || !password) {
+      toast("Name, email and password are all needed", true);
+      return;
+    }
+    try {
+      await api("/api/staff", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          email,
+          password,
+          role: (byId("uRole") as HTMLSelectElement).value,
+          branchId: (byId("uBranch") as HTMLSelectElement).value || null,
+        }),
+      });
+      toast(`${name} can now sign in`);
+      renderTeam();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not add the account", true);
+    }
+  });
+
+  byId("saveBranch").addEventListener("click", async () => {
+    const name = (byId("brName") as HTMLInputElement).value.trim();
+    if (!name) {
+      toast("Give the branch a name", true);
+      return;
+    }
+    try {
+      await api("/api/branches", {
+        method: "POST",
+        body: JSON.stringify({ name, address: (byId("brAddress") as HTMLInputElement).value }),
+      });
+      toast(`${name} added`);
+      // The new branch changes the session payload, so refresh it before redrawing.
+      session = await api<Session>("/api/session");
+      renderApp();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not add the branch", true);
+    }
+  });
+
+  await loadStaff();
+  renderBranchList();
+}
+
+async function loadStaff(): Promise<void> {
+  const box = document.getElementById("staffList");
+  if (!box) return;
+  try {
+    const data = await api<{ staff: { user_id: string; name: string; email: string; role: string; branch_id: string | null }[] }>("/api/staff");
+    const branchOf = (id: string | null): string =>
+      id ? (session?.branches.find((b) => b.branch_id === id)?.name ?? "—") : "All branches";
+    box.innerHTML = `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Branch</th></tr></thead><tbody>
+      ${data.staff
+        .map(
+          (u) => `<tr><td><b>${esc(u.name)}</b></td><td>${esc(u.email)}</td><td>${esc(u.role)}</td><td>${esc(branchOf(u.branch_id))}</td></tr>`,
+        )
+        .join("")}
+    </tbody></table>`;
+  } catch (err) {
+    box.innerHTML = `<div class="empty">${esc(err instanceof Error ? err.message : "Could not load the team")}</div>`;
+  }
+}
+
+function renderBranchList(): void {
+  const box = document.getElementById("branchList");
+  if (!box || !session) return;
+  const plan = session.tenant.plan.name;
+  box.innerHTML = `<table><thead><tr><th>Branch</th><th>Address</th></tr></thead><tbody>
+    ${session.branches
+      .map((b) => `<tr><td><b>${esc(b.name)}</b></td><td>${esc(b.address ?? "—")}</td></tr>`)
+      .join("")}
+  </tbody></table>
+  <div class="note">The ${esc(plan)} plan allows ${session.tenant.usage.shops} branch${
+    session.tenant.usage.shops === 1 ? "" : "es"
+  } right now.</div>`;
+}
 
 async function boot(): Promise<void> {
   if (!token) {
