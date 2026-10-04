@@ -34,9 +34,9 @@ function toast(message, isError = false) {
   node.className = `toast on${isError ? " err" : ""}`;
   window.setTimeout(() => node.className = "toast", 3200);
 }
-function openModal(html) {
+function openModal(html, wide = false) {
   const modal = byId("modal");
-  modal.innerHTML = `<div class="sheet">${html}</div>`;
+  modal.innerHTML = `<div class="sheet${wide ? " wide" : ""}">${html}</div>`;
   modal.classList.remove("hidden");
 }
 function closeModal() {
@@ -650,7 +650,10 @@ var flagsFor = (p) => p.controlled_class !== "none" ? ` <span class="badge b-exp
 async function renderProducts() {
   byId("main").innerHTML = `<section class="card">
     <h2>Products <span class="badge b-mute">${esc(branchName())}</span>
-      <button class="btn sm primary" id="addProduct">Add product</button></h2>
+      <span style="display:flex;gap:8px">
+        <button class="btn sm ghost" id="importCatalogue">Import catalogue</button>
+        <button class="btn sm primary" id="addProduct">Add product</button>
+      </span></h2>
     <div class="scanrow"><input id="productSearch" placeholder="Filter by name, barcode or brand" autocomplete="off"></div>
     <div id="productTable"><div class="empty">Loading\u2026</div></div>
     <div class="note">Stock is counted per batch, not per product. A product with no batch has no stock \u2014 use <b>Receive stock</b> to add some.</div>
@@ -658,6 +661,7 @@ async function renderProducts() {
   const search = byId("productSearch");
   search.addEventListener("input", debounce(() => void loadCatalogue(search.value), 160));
   byId("addProduct").addEventListener("click", () => void productModal());
+  byId("importCatalogue").addEventListener("click", () => importModal());
   await loadCatalogue("");
 }
 async function loadCatalogue(filter) {
@@ -978,6 +982,97 @@ function renderBranchList() {
     ${session.branches.map((b) => `<tr><td><b>${esc(b.name)}</b></td><td>${esc(b.address ?? "\u2014")}</td></tr>`).join("")}
   </tbody></table>
   <div class="note">The ${esc(plan)} plan allows ${session.tenant.usage.shops} branch${session.tenant.usage.shops === 1 ? "" : "es"} right now.</div>`;
+}
+function importModal() {
+  openModal(
+    `<h2>Import a catalogue</h2>
+    <p style="color:var(--muted);font-size:13px;margin:-6px 0 14px">
+      Paste your product list or choose a CSV file. Columns are matched by name, so
+      <b>Item</b>, <b>Qty</b>, <b>SP</b>, <b>Batch</b> and <b>Expiry</b> all work.
+      Nothing is saved until you have seen the preview.
+    </p>
+    <div class="fld"><label>CSV file</label><input id="csvFile" type="file" accept=".csv,text/csv,text/plain"></div>
+    <div class="fld" style="margin-top:10px"><label>Or paste it here</label>
+      <textarea id="csvText" rows="7" spellcheck="false" style="border:1px solid var(--line);border-radius:9px;padding:8px 10px;background:#fcfcfe;width:100%;font-family:'Courier New',monospace;font-size:12.5px" placeholder="Name,Price,Qty,Expiry&#10;Paracetamol 500mg,5.00,240,30/06/2027"></textarea>
+    </div>
+    <div id="importReport"></div>
+    <div class="foot">
+      <button class="btn ghost" id="cancel">Cancel</button>
+      <button class="btn" id="preview">Preview</button>
+      <button class="btn primary" id="commit" disabled>Import</button>
+    </div>`,
+    true
+  );
+  const csvText = byId("csvText");
+  const commit = byId("commit");
+  byId("cancel").addEventListener("click", closeModal);
+  byId("csvFile").addEventListener("change", async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    csvText.value = await file.text();
+    commit.disabled = true;
+    toast(`${file.name} loaded`);
+  });
+  csvText.addEventListener("input", () => {
+    commit.disabled = true;
+  });
+  const send = async (dryRun) => {
+    const body = await api("/api/products/import", {
+      method: "POST",
+      body: JSON.stringify({ csv: csvText.value, branchId, dryRun })
+    });
+    return body.report;
+  };
+  byId("preview").addEventListener("click", async () => {
+    if (!csvText.value.trim()) {
+      toast("Paste your list or choose a file first", true);
+      return;
+    }
+    try {
+      const report = await send(true);
+      renderImportReport(report, false);
+      commit.disabled = report.ok === 0;
+      commit.textContent = report.ok ? `Import ${report.ok}` : "Import";
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not read that file", true);
+    }
+  });
+  commit.addEventListener("click", async () => {
+    try {
+      const report = await send(false);
+      renderImportReport(report, true);
+      commit.disabled = true;
+      commit.textContent = "Imported";
+      toast(`${report.ok} product${report.ok === 1 ? "" : "s"} imported`);
+      await loadCatalogue("");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "The import failed", true);
+    }
+  });
+}
+function renderImportReport(report, committed) {
+  const box = document.getElementById("importReport");
+  if (!box) return;
+  const matched = Object.entries(report.mapping).map(([field, header]) => `${field} \u2190 ${header}`).join("  \xB7  ");
+  const shown = report.rows.slice(0, 300);
+  box.innerHTML = `<div style="margin-top:16px;padding-top:12px;border-top:1px dashed var(--line)">
+    <b style="font-size:13.5px">${committed ? "Imported" : "Preview"}: ${report.total} rows read, ${report.ok} ${committed ? "imported" : "to import"}${report.errors ? `, ${report.errors} with problems` : ""}${report.skipped ? `, ${report.skipped} skipped` : ""}.</b>
+    <div style="font-size:11.5px;color:var(--muted);margin:6px 0 10px">Columns matched: ${esc(matched || "none")}</div>
+    <div style="max-height:300px;overflow:auto">
+      <table><thead><tr><th>Line</th><th>Product</th><th>What happens</th></tr></thead><tbody>
+      ${shown.map((row) => {
+    const badge = row.status === "ok" ? `<span class="badge b-ok">${committed ? "added" : "ok"}</span>` : row.status === "skipped" ? `<span class="badge b-mute">skip</span>` : `<span class="badge b-out">error</span>`;
+    const detail = row.preview ? `${money(row.preview.price)}${row.preview.quantity ? ` \xB7 ${row.preview.quantity} in stock` : ""}${row.preview.expiry ? ` \xB7 exp ${esc(row.preview.expiry)}` : ""}` : "";
+    return `<tr>
+            <td>${row.line}</td>
+            <td><b>${esc(row.name)}</b>${detail ? `<br><span style="font-size:11.5px;color:var(--muted)">${detail}</span>` : ""}</td>
+            <td>${badge} ${esc(row.message)}${row.notes?.length ? `<br><span style="font-size:11.5px;color:var(--muted)">${esc(row.notes.join("; "))}</span>` : ""}</td>
+          </tr>`;
+  }).join("")}
+      </tbody></table>
+    </div>
+    ${report.rows.length > shown.length ? `<div class="note">Showing the first ${shown.length} rows.</div>` : ""}
+  </div>`;
 }
 async function boot() {
   if (!token) {

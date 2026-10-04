@@ -25,6 +25,7 @@ import {
   writeOffBatch,
 } from "./catalog.ts";
 import { assetValues, salesSummary, todayTotals, topProducts } from "./reports.ts";
+import { importCatalogue, type ImportField } from "./import.ts";
 import { ValidationError } from "./util.ts";
 import type { Actor } from "./actor.ts";
 
@@ -344,6 +345,23 @@ export function createRequestHandler(
           perishable: body.perishable === undefined ? true : Boolean(body.perishable),
         });
         send(res, 201, { productId });
+        return;
+      }
+
+      // Importing an existing catalogue. The preview is the same call with dryRun,
+      // so what a person approves is exactly what gets written.
+      if (method === "POST" && path === "/api/products/import") {
+        const me = await actor();
+        const body = await readJson(req);
+        const branchId = str(body.branchId);
+        await assertBranch(me, branchId);
+        const report = await importCatalogue(me, {
+          csv: str(body.csv),
+          branchId,
+          mapping: (body.mapping ?? undefined) as Partial<Record<ImportField, string>> | undefined,
+          dryRun: Boolean(body.dryRun),
+        });
+        send(res, 200, { report });
         return;
       }
 

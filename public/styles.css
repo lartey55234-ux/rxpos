@@ -88,6 +88,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .modal.hidden{display:none}
 .sheet{background:#fff;border-radius:16px;max-width:560px;width:100%;max-height:88vh;overflow:auto;padding:20px}
 .sheet h2{font-size:17px;margin-bottom:12px}
+.sheet.wide{max-width:960px}
 .sheet .foot{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
 .receipt{font-family:"Courier New",monospace;font-size:12.5px;background:#fcfcfe;border:1px dashed #d5d7e6;border-radius:10px;padding:14px}
 .receipt h3{text-align:center;font-size:14px;letter-spacing:.08em}
