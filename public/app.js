@@ -1044,6 +1044,8 @@ function importModal() {
       commit.disabled = true;
       commit.textContent = "Imported";
       toast(`${report.ok} product${report.ok === 1 ? "" : "s"} imported`);
+      byId("cancel").textContent = "Close";
+      byId("cancel").className = "btn primary";
       await loadCatalogue("");
     } catch (err) {
       toast(err instanceof Error ? err.message : "The import failed", true);
