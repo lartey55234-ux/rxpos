@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Pharmacy POS \u2014 multi-tenant counter, batches, expiry and controlled-drug compliance",
+  "description": "Pharmacy POS — multi-tenant counter, batches, expiry and controlled-drug compliance",
   "engines": {
     "node": ">=24"
   },
@@ -13,7 +13,7 @@
     "check": "node --disable-warning=ExperimentalWarning --check src/tenant.ts",
     "build": "esbuild src/client/app.ts --bundle --format=esm --outfile=public/app.js --target=es2022 --log-level=warning",
     "demo": "npm run build && node --disable-warning=ExperimentalWarning scripts/demo.ts",
-    "start": "node --disable-warning=ExperimentalWarning scripts/demo.ts"
+    "start": "node --disable-warning=ExperimentalWarning scripts/serve.ts"
   },
   "devDependencies": {
     "esbuild": "^0.28.2"

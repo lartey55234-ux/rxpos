@@ -1,0 +1,12 @@
+node_modules/
+.data/
+*.db
+*.db-wal
+*.db-shm
+
+
+# Local screenshots and one-off payloads
+shot-*.png
+create_*.json
+update_*.json
+fix_*.json

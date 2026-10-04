@@ -115,7 +115,73 @@ Node alone.
 - Purchases exist in the schema and on the receipt path, but there is no ordering flow.
 - Paystack and mobile money are recorded, not charged.
 - Email is globally unique, so one login cannot yet belong to two pharmacies.
-- No CI, no deploy target, no git remote.
+- No git remote yet, so the workflow in `.github/workflows/ci.yml` has never run on a real push.
 - The Dangerous Drugs Record is stored electronically. Whether an inspector accepts a
   printed electronic register or expects the physical book should be confirmed with
   the Pharmacy Council before a pilot.
+
+## Running it
+
+```bash
+npm run demo      # build, seed a sample pharmacy, serve on :4173 — in memory
+npm test          # 50 tests: tenancy, auth, sales, compliance, the HTTP API
+npm start         # the deployed entry point, database on disk
+```
+
+`npm run demo` keeps everything in memory and throws it away on exit, which is what
+you want while developing. `npm start` reads its configuration from the environment
+and is what a host runs.
+
+## Configuration
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `PORT` | `4173` | Port to listen on. Hosts set this for you. |
+| `HOST` | `0.0.0.0` | Interface to bind. |
+| `DATA_DIR` | `.data` | Directory for the database when `DATABASE_PATH` is unset. |
+| `DATABASE_PATH` | `$DATA_DIR/rxpos.db` | The SQLite file. `:memory:` throws data away on exit. |
+| `SEED_DEMO` | on unless `NODE_ENV=production` | Create the sample pharmacy, but only on an empty database. |
+| `NODE_ENV` | — | `production` turns off demo seeding. |
+
+Seeding is idempotent: a restart with `SEED_DEMO=1` finds existing pharmacies and
+leaves them alone rather than duplicating the sample one.
+
+## Deploying
+
+Node 24 is required — the app uses the built-in `node:sqlite`, so there are no
+runtime dependencies to install.
+
+**Render.** `render.yaml` is a blueprint. The free plan has no persistent disk, so
+it runs the database in memory and re-seeds the sample pharmacy on each start:
+fine for showing someone the product, wrong for holding their real stock. To make
+it durable, set `plan: starter`, uncomment the `disk:` block, and point
+`DATABASE_PATH` at `/var/data/rxpos.db`.
+
+**Fly.io.** `fly.toml` and the `Dockerfile` are ready. Create the volume first:
+
+```bash
+fly volumes create rxpos_data --size 1
+fly deploy
+```
+
+**Anywhere else.** `npm ci && npm run build`, then `node scripts/serve.ts` with
+`NODE_ENV=production` and a mounted `DATA_DIR`. The health check is `GET /healthz`.
+
+## What the deployed instance does for itself
+
+- `GET /healthz` answers without a token, for load balancers and uptime monitors.
+- `POST /api/signup` lets a pharmacy open its own account from the login screen —
+  tenant, first branch and owner account in one transaction.
+- Sign-in is limited to 30 attempts per IP per 15 minutes, signup to 5 per hour.
+- Every response carries a content security policy, `nosniff`, and frame denial.
+  The policy blocks inline and evaluated script, which is why the browser tests
+  wait on DOM state rather than evaluating predicates in the page.
+- Request bodies are capped at 256 KB and a malformed one is a 400, not a crash.
+- `SIGTERM` closes the server and the database, with a 5 second backstop, so a
+  redeploy does not leave a half-written database behind.
+
+## Verifying a deploy
+
+`scripts/verify-deploy.sh <url>` boots nothing and assumes nothing: it checks the
+health endpoint, that the counter page is served with its security headers, that a
+pharmacy can register, and that a duplicate registration is refused.

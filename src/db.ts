@@ -11,6 +11,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 export function openDb(path = ":memory:"): Db {
   const db = new DatabaseSync(path);
   db.exec("PRAGMA foreign_keys = ON");
+  // Write-ahead logging so a redeploy cannot corrupt a database that lives on disk.
+  if (path !== ":memory:") db.exec("PRAGMA journal_mode = WAL");
   return db;
 }
 

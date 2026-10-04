@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+      # Boot the real entry point the way a host would, then talk to it.
+      - name: Smoke test the deployed entry point
+        run: |
+          set -euo pipefail
+          NODE_ENV=production SEED_DEMO=1 DATABASE_PATH=:memory: PORT=4173 \
+            node --disable-warning=ExperimentalWarning scripts/serve.ts &
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:4173/healthz && break
+            sleep 1
+          done
+          curl -fsS -o /dev/null -w 'index.html %{http_code}\n' http://127.0.0.1:4173/
+          curl -fsS -X POST http://127.0.0.1:4173/api/signup \
+            -H 'content-type: application/json' \
+            -d '{"pharmacyName":"CI Pharmacy","ownerName":"CI Owner","email":"ci@example.com","password":"secret123","planId":"starter"}' \
+            | grep -q '"token"'
+          echo "signup ok"

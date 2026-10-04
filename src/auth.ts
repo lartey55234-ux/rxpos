@@ -5,7 +5,7 @@ import { TenantScope } from "./tenant.ts";
 import type { Actor } from "./actor.ts";
 import { PLAN_SEED, assertWithinPlan } from "./plans.ts";
 import { writeAudit } from "./audit.ts";
-import { newId, nowIso } from "./util.ts";
+import { ValidationError, newId, nowIso } from "./util.ts";
 import { assertCan, type Role } from "./permissions.ts";
 
 const KEYLEN = 64;
@@ -54,8 +54,28 @@ export type RegisterResult = {
   expiresAt: string;
 };
 
+/**
+ * Reject registrations that cannot work, in words a pharmacy owner can act on.
+ * Called from registerPharmacy so every entry point is covered.
+ */
+export function validateRegistration(input: RegisterInput): void {
+  if ((input.pharmacyName ?? "").trim().length < 2) {
+    throw new ValidationError("Enter the pharmacy name");
+  }
+  if ((input.ownerName ?? "").trim().length < 2) {
+    throw new ValidationError("Enter your name");
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((input.email ?? "").trim())) {
+    throw new ValidationError("Enter a valid email address");
+  }
+  if ((input.password ?? "").length < 8) {
+    throw new ValidationError("Choose a password of at least 8 characters");
+  }
+}
+
 /** Create a pharmacy (tenant) with its first branch and an owner account. */
 export function registerPharmacy(db: Db, input: RegisterInput): RegisterResult {
+  validateRegistration(input);
   seedPlans(db);
   const planId = input.planId ?? "starter";
   const email = input.email.trim().toLowerCase();

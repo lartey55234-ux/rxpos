@@ -1,0 +1,30 @@
+# Render blueprint for the hosted demo.
+#
+# The free plan has no persistent disk, so this instance keeps its database in
+# memory and re-seeds the sample pharmacy on each start. That is right for
+# showing a pharmacy owner the product, and wrong for holding their real stock.
+#
+# To make it durable: set plan to `starter`, uncomment the disk below, and set
+# DATABASE_PATH to /var/data/rxpos.db.
+services:
+  - type: web
+    name: rxpos
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm ci && npm run build
+    startCommand: node --disable-warning=ExperimentalWarning scripts/serve.ts
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "24.14.1"
+      - key: NODE_ENV
+        value: production
+      - key: SEED_DEMO
+        value: "1"
+      - key: DATABASE_PATH
+        value: ":memory:"
+    # disk:
+    #   name: rxpos-data
+    #   mountPath: /var/data
+    #   sizeGB: 1

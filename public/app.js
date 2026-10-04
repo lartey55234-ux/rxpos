@@ -48,6 +48,7 @@ function signOut() {
   token = "";
   session = null;
   localStorage.removeItem("rxpos.token");
+  authMode = "signin";
   renderLogin();
 }
 function debounce(fn, ms) {
@@ -57,22 +58,51 @@ function debounce(fn, ms) {
     handle = window.setTimeout(() => fn(...args), ms);
   });
 }
+var authMode = "signin";
+var PLANS = [
+  { id: "free", label: "Free \u2014 20 products, 1 shop" },
+  { id: "starter", label: "Starter \u2014 GHS 60/month" },
+  { id: "standard", label: "Standard \u2014 GHS 100/month" },
+  { id: "pro", label: "Pro \u2014 GHS 150/month" }
+];
 function renderLogin() {
-  byId("app").innerHTML = `<div class="login"><div class="card">
-    <h1>rxpos</h1>
-    <p>Counter, stock and expiry for pharmacies.</p>
-    <div class="fld"><label>Email</label><input id="email" type="email" autocomplete="username"></div>
-    <div class="fld" style="margin-top:10px"><label>Password</label><input id="password" type="password" autocomplete="current-password"></div>
-    <button class="btn primary" id="signIn" style="width:100%;margin-top:16px">Sign in</button>
-  </div></div>`;
+  byId("app").innerHTML = authMode === "signin" ? `<div class="login"><div class="card">
+          <h1>rxpos</h1>
+          <p>Counter, stock and expiry for pharmacies.</p>
+          <div class="fld"><label>Email</label><input id="email" type="email" autocomplete="username"></div>
+          <div class="fld" style="margin-top:10px"><label>Password</label><input id="password" type="password" autocomplete="current-password"></div>
+          <button class="btn primary" id="submit" style="width:100%;margin-top:16px">Sign in</button>
+          <button class="btn ghost" id="swap" style="width:100%;margin-top:8px">New pharmacy? Create an account</button>
+        </div></div>` : `<div class="login wide"><div class="card">
+          <h1>Create your pharmacy</h1>
+          <p>You can add staff and stock as soon as you are in.</p>
+          <div class="fld"><label>Pharmacy name</label><input id="pharmacyName" type="text" autocomplete="organization"></div>
+          <div class="fld" style="margin-top:10px"><label>Your name</label><input id="ownerName" type="text" autocomplete="name"></div>
+          <div class="fld" style="margin-top:10px"><label>Email</label><input id="email" type="email" autocomplete="username"></div>
+          <div class="fld" style="margin-top:10px"><label>Password</label><input id="password" type="password" autocomplete="new-password"></div>
+          <div class="fld" style="margin-top:10px"><label>Branch name</label><input id="branchName" type="text" placeholder="Main Pharmacy"></div>
+          <div class="fld" style="margin-top:10px"><label>Plan</label><select id="planId">${PLANS.map(
+    (plan) => `<option value="${plan.id}"${plan.id === "starter" ? " selected" : ""}>${esc(plan.label)}</option>`
+  ).join("")}</select></div>
+          <button class="btn primary" id="submit" style="width:100%;margin-top:16px">Create pharmacy</button>
+          <button class="btn ghost" id="swap" style="width:100%;margin-top:8px">Already have an account? Sign in</button>
+        </div></div>`;
   const submit = async () => {
+    const signingIn = authMode === "signin";
+    const email = byId("email").value;
+    const password = byId("password").value;
+    const payload = signingIn ? { email, password } : {
+      email,
+      password,
+      pharmacyName: byId("pharmacyName").value,
+      ownerName: byId("ownerName").value,
+      branchName: byId("branchName").value,
+      planId: byId("planId").value
+    };
     try {
-      const body = await api("/api/login", {
+      const body = await api(signingIn ? "/api/login" : "/api/signup", {
         method: "POST",
-        body: JSON.stringify({
-          email: byId("email").value,
-          password: byId("password").value
-        })
+        body: JSON.stringify(payload)
       });
       token = body.token;
       localStorage.setItem("rxpos.token", token);
@@ -81,10 +111,14 @@ function renderLogin() {
       view = "counter";
       renderApp();
     } catch (err) {
-      toast(err instanceof Error ? err.message : "Sign in failed", true);
+      toast(err instanceof Error ? err.message : "That did not work", true);
     }
   };
-  byId("signIn").addEventListener("click", submit);
+  byId("submit").addEventListener("click", () => void submit());
+  byId("swap").addEventListener("click", () => {
+    authMode = authMode === "signin" ? "signup" : "signin";
+    renderLogin();
+  });
   byId("password").addEventListener("keydown", (event) => {
     if (event.key === "Enter") void submit();
   });

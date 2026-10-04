@@ -3,7 +3,8 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Db } from "./db.ts";
-import { AuthError, authenticate, login } from "./auth.ts";
+import { AuthError, authenticate, login, registerPharmacy, seedPlans } from "./auth.ts";
+import { RateLimitError, RateLimiter } from "./ratelimit.ts";
 import { PermissionError, can, type Permission, type Role } from "./permissions.ts";
 import { PlanLimitError, planFor, usageFor } from "./plans.ts";
 import { SaleError, createSale, getReceipt } from "./sales.ts";
@@ -33,6 +34,34 @@ const MIME: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
+const MAX_BODY_BYTES = 256 * 1024;
+
+/**
+ * Sent with every response. The client is one bundled module and never talks to
+ * another origin, so the policy can stay this tight.
+ */
+const SECURITY_HEADERS: Record<string, string> = {
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+  "referrer-policy": "no-referrer",
+  "strict-transport-security": "max-age=31536000; includeSubDomains",
+  "content-security-policy":
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data:; connect-src 'self'; object-src 'none'; " +
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+};
+
+function secure(res: ServerResponse): void {
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) res.setHeader(name, value);
+}
+
+/** Behind a proxy the socket address is the proxy, so trust the first forwarded hop. */
+function clientKey(req: IncomingMessage): string {
+  const forwarded = req.headers["x-forwarded-for"];
+  const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(",")[0]?.trim();
+  return first || req.socket.remoteAddress || "unknown";
+}
+
 const PERMISSIONS: Permission[] = [
   "sell",
   "dispense_controlled",
@@ -57,13 +86,24 @@ function send(res: ServerResponse, status: number, body: unknown): void {
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_BODY_BYTES) throw new ValidationError("Request body is too large");
+    chunks.push(chunk as Buffer);
+  }
   const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    throw new ValidationError("Request body is not valid JSON");
+  }
 }
 
 function statusFor(err: unknown): number {
   if (err instanceof AuthError) return 401;
+  if (err instanceof RateLimitError) return 429;
   if (err instanceof PermissionError) return 403;
   if (err instanceof PlanLimitError || err instanceof SaleError || err instanceof ValidationError) return 400;
   return 500;
@@ -74,11 +114,40 @@ function statusFor(err: unknown): number {
  * bearer token resolves to one actor, and every query runs through that actor's
  * TenantScope.
  */
-export function createRequestHandler(db: Db, publicDir = join(here, "public")) {
+export type HandlerOptions = {
+  /** Attempts allowed per IP before a cooldown. Defaults suit a public instance. */
+  loginLimit?: number;
+  signupLimit?: number;
+};
+
+export function createRequestHandler(
+  db: Db,
+  publicDir = join(here, "public"),
+  options: HandlerOptions = {},
+) {
+  // Per process, which is all the pilot needs: enough to blunt password grinding
+  // and bulk registration without pretending to be a distributed limiter.
+  const loginLimiter = new RateLimiter(options.loginLimit ?? 30, 15 * 60 * 1000);
+  const signupLimiter = new RateLimiter(options.signupLimit ?? 5, 60 * 60 * 1000);
+
   return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
     const path = url.pathname;
     const method = req.method ?? "GET";
+
+    secure(res);
+
+    // Load balancers and uptime monitors reach this without a token.
+    if (path === "/healthz") {
+      let healthy = false;
+      try {
+        healthy = (db.prepare("SELECT 1 AS ok").get() as { ok: number }).ok === 1;
+      } catch {
+        healthy = false;
+      }
+      send(res, healthy ? 200 : 503, { status: healthy ? "ok" : "degraded" });
+      return;
+    }
 
     if (!path.startsWith("/api/")) {
       await serveStatic(res, publicDir, path);
@@ -94,9 +163,40 @@ export function createRequestHandler(db: Db, publicDir = join(here, "public")) {
       };
 
       if (method === "POST" && path === "/api/login") {
+        loginLimiter.hit(clientKey(req));
         const body = await readJson(req);
         const session = login(db, String(body.email ?? ""), String(body.password ?? ""));
         send(res, 200, { token: session.token, ...sessionPayload(db, authenticate(db, session.token)) });
+        return;
+      }
+
+      // Self-serve: a pharmacy owner can open their own account from the login screen.
+      if (method === "POST" && path === "/api/signup") {
+        signupLimiter.hit(clientKey(req));
+        const body = await readJson(req);
+        seedPlans(db);
+
+        const email = String(body.email ?? "").trim().toLowerCase();
+        const planId = body.planId ? String(body.planId) : "starter";
+        if (!db.prepare("SELECT 1 AS x FROM plans WHERE plan_id = ?").get(planId)) {
+          throw new ValidationError(`Unknown plan ${planId}`);
+        }
+        // Email is unique across the workspace, so catch the clash before the insert.
+        if (db.prepare("SELECT 1 AS x FROM users WHERE email = ?").get(email)) {
+          send(res, 409, { error: "That email already has an account. Sign in instead." });
+          return;
+        }
+
+        const result = registerPharmacy(db, {
+          pharmacyName: String(body.pharmacyName ?? ""),
+          ownerName: String(body.ownerName ?? ""),
+          email,
+          password: String(body.password ?? ""),
+          planId,
+          branchName: body.branchName ? String(body.branchName) : undefined,
+          phone: body.phone ? String(body.phone) : null,
+        });
+        send(res, 201, { token: result.token, ...sessionPayload(db, authenticate(db, result.token)) });
         return;
       }
 
@@ -272,6 +372,8 @@ async function serveStatic(res: ServerResponse, publicDir: string, path: string)
     res.writeHead(200, {
       "content-type": MIME[extname(file)] ?? "application/octet-stream",
       "content-length": body.length,
+      // The bundle carries no content hash, so let the browser revalidate it.
+      "cache-control": extname(file) === ".html" ? "no-store" : "no-cache",
     });
     res.end(body);
   } catch {
@@ -279,9 +381,15 @@ async function serveStatic(res: ServerResponse, publicDir: string, path: string)
   }
 }
 
-export function startServer(db: Db, port = 0, publicDir?: string): Promise<Server> {
-  const server = createServer(createRequestHandler(db, publicDir));
+export function startServer(
+  db: Db,
+  port = 0,
+  publicDir?: string,
+  host = "0.0.0.0",
+  options: HandlerOptions = {},
+): Promise<Server> {
+  const server = createServer(createRequestHandler(db, publicDir, options));
   return new Promise((resolve) => {
-    server.listen(port, () => resolve(server));
+    server.listen(port, host, () => resolve(server));
   });
 }
