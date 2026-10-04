@@ -15,6 +15,8 @@ export type Config = {
   /** postgres:// for PostgreSQL, otherwise a SQLite file path or :memory:. */
   databaseUrl: string;
   seedDemo: boolean;
+  /** Absent means card and mobile money are not offered. */
+  paystackSecretKey: string | null;
   production: boolean;
 };
 
@@ -42,6 +44,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     databaseUrl,
     // A hosted demo wants the sample pharmacy; a real instance must not invent one.
     seedDemo: flag(env.SEED_DEMO, !production),
+    paystackSecretKey: env.PAYSTACK_SECRET_KEY?.trim() || null,
     production,
   };
 }

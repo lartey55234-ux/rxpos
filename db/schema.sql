@@ -212,6 +212,25 @@ CREATE TABLE IF NOT EXISTS sale_items (
   line_total_pesewas INTEGER NOT NULL
 );
 
+-- A charge in progress. Created before the sale, because money is taken first and
+-- stock moves only once Paystack confirms it. payload_json holds the cart so the
+-- sale can be built on confirmation, including from a webhook with no browser.
+CREATE TABLE IF NOT EXISTS payment_intents (
+  intent_id       TEXT PRIMARY KEY,
+  tenant_id       TEXT NOT NULL REFERENCES tenants(tenant_id),
+  branch_id       TEXT NOT NULL REFERENCES branches(branch_id),
+  user_id         TEXT NOT NULL REFERENCES users(user_id),
+  reference       TEXT NOT NULL UNIQUE,
+  provider        TEXT NOT NULL DEFAULT 'paystack',
+  amount_pesewas  INTEGER NOT NULL,
+  channel         TEXT NOT NULL,
+  payload_json    TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'pending',
+  sale_id         TEXT REFERENCES sales(sale_id),
+  created_at      TEXT NOT NULL,
+  confirmed_at    TEXT
+);
+
 CREATE TABLE IF NOT EXISTS payments (
   payment_id      TEXT PRIMARY KEY,
   tenant_id       TEXT NOT NULL REFERENCES tenants(tenant_id),
@@ -264,3 +283,6 @@ CREATE INDEX IF NOT EXISTS idx_movements_tenant       ON stock_movements(tenant_
 CREATE INDEX IF NOT EXISTS idx_sales_tenant_date      ON sales(tenant_id, sale_date);
 CREATE INDEX IF NOT EXISTS idx_users_tenant           ON users(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_register_tenant        ON controlled_register(tenant_id, entry_date);
+
+CREATE INDEX IF NOT EXISTS idx_intents_tenant  ON payment_intents(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_intents_ref     ON payment_intents(reference);

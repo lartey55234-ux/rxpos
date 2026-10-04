@@ -98,6 +98,18 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+/** The raw bytes, because Paystack signs the body as sent. */
+async function readRaw(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_BODY_BYTES) throw new ValidationError("Request body is too large");
+    chunks.push(chunk as Buffer);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -132,6 +144,9 @@ export type HandlerOptions = {
   /** Attempts allowed per IP before a cooldown. Defaults suit a public instance. */
   loginLimit?: number;
   signupLimit?: number;
+  /** Absent, or null, means card and mobile money are not offered. */
+  gateway?: PaymentGateway | null;
+  paystackSecretKey?: string | null;
 };
 
 export function createRequestHandler(
@@ -141,6 +156,14 @@ export function createRequestHandler(
 ) {
   // Per process, which is all the pilot needs: enough to blunt password grinding
   // and bulk registration without pretending to be a distributed limiter.
+  const secretKey = options.paystackSecretKey ?? null;
+  const gateway =
+    options.gateway !== undefined
+      ? options.gateway
+      : secretKey
+        ? new PaystackGateway(secretKey)
+        : null;
+
   const loginLimiter = new RateLimiter(options.loginLimit ?? 30, 15 * 60 * 1000);
   const signupLimiter = new RateLimiter(options.signupLimit ?? 5, 60 * 60 * 1000);
 
@@ -177,11 +200,38 @@ export function createRequestHandler(
         return authenticate(db, token);
       };
 
+      // Paystack calls this when a charge settles, which for mobile money is often
+      // after the browser has gone. The signature is the authentication.
+      if (method === "POST" && path === "/api/payments/webhook") {
+        const raw = await readRaw(req);
+        const signature = String(req.headers["x-paystack-signature"] ?? "");
+        if (!secretKey || !verifyWebhookSignature(raw, signature, secretKey)) {
+          send(res, 401, { error: "Bad signature" });
+          return;
+        }
+        let event: { event?: string; data?: { reference?: string } } = {};
+        try {
+          event = JSON.parse(raw || "{}");
+        } catch {
+          throw new ValidationError("Webhook body is not valid JSON");
+        }
+        if (event.event === "charge.success" && event.data?.reference && gateway) {
+          try {
+            await confirmCharge(db, gateway, event.data.reference);
+          } catch (err) {
+            // Answer 200 anyway: Paystack retries, and a mismatch needs a human.
+            console.error("[rxpos] webhook charge.success:", err);
+          }
+        }
+        send(res, 200, { received: true });
+        return;
+      }
+
       if (method === "POST" && path === "/api/login") {
         loginLimiter.hit(clientKey(req));
         const body = await readJson(req);
         const session = await login(db, String(body.email ?? ""), String(body.password ?? ""));
-        send(res, 200, { token: session.token, ...(await sessionPayload(db, await authenticate(db, session.token))) });
+        send(res, 200, { token: session.token, ...(await sessionPayload(db, await authenticate(db, session.token), gateway)) });
         return;
       }
 
@@ -211,12 +261,12 @@ export function createRequestHandler(
           branchName: body.branchName ? String(body.branchName) : undefined,
           phone: body.phone ? String(body.phone) : null,
         });
-        send(res, 201, { token: result.token, ...(await sessionPayload(db, await authenticate(db, result.token))) });
+        send(res, 201, { token: result.token, ...(await sessionPayload(db, await authenticate(db, result.token), gateway)) });
         return;
       }
 
       if (method === "GET" && path === "/api/session") {
-        send(res, 200, await sessionPayload(db, await actor()));
+        send(res, 200, await sessionPayload(db, await actor(), gateway));
         return;
       }
 
@@ -452,6 +502,37 @@ export function createRequestHandler(
         return;
       }
 
+      if (method === "POST" && path === "/api/payments/charge") {
+        if (!gateway) throw new ValidationError("Card and mobile money are not switched on for this deployment");
+        const me = await actor();
+        const body = await readJson(req);
+        const channel = str(body.channel) as Channel;
+        if (channel !== "card" && channel !== "mobile_money") {
+          throw new ValidationError("Channel must be card or mobile_money");
+        }
+        const charge = await startCharge(me, gateway, { saleId: str(body.saleId), channel });
+        send(res, 201, { charge });
+        return;
+      }
+
+      if (method === "POST" && path === "/api/payments/confirm") {
+        if (!gateway) throw new ValidationError("Card and mobile money are not switched on for this deployment");
+        const me = await actor();
+        const body = await readJson(req);
+        const result = await confirmCharge(db, gateway, str(body.reference));
+        send(res, 200, {
+          payment: result,
+          ...(result.saleId ? { receipt: await getReceipt(me, result.saleId) } : {}),
+        });
+        return;
+      }
+
+      const paymentMatch = /^\/api\/sales\/([^/]+)\/payment$/.exec(path);
+      if (method === "GET" && paymentMatch) {
+        send(res, 200, await paymentState(await actor(), paymentMatch[1]));
+        return;
+      }
+
       const writeOffMatch = /^\/api\/batches\/([^/]+)\/writeoff$/.exec(path);
       if (method === "POST" && writeOffMatch) {
         const me = await actor();
@@ -470,7 +551,7 @@ export function createRequestHandler(
   };
 }
 
-async function sessionPayload(db: Database, me: Actor) {
+async function sessionPayload(db: Database, me: Actor, gateway: PaymentGateway | null) {
   const tenant = await me.scope.tenant<{ name: string }>();
   const user = await me.scope.get<{ name: string }>(
     "SELECT name FROM users WHERE tenant_id = {{tenant}} AND user_id = ?",
@@ -491,6 +572,7 @@ async function sessionPayload(db: Database, me: Actor) {
       },
     },
     branches: await branchesFor(me),
+    payments: { enabled: gateway !== null },
     permissions: Object.fromEntries(PERMISSIONS.map((p) => [p, can(me.role as Role, p)])),
   };
 }
