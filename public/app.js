@@ -1,5 +1,11 @@
 // src/client/app.ts
 var byId = (id) => document.getElementById(id);
+var NoConnection = class extends Error {
+  constructor() {
+    super("No connection to the server \u2014 nothing has been recorded. Try again when the signal returns.");
+    this.name = "NoConnection";
+  }
+};
 var money = (pesewas) => `GHS ${(pesewas / 100).toFixed(2)}`;
 var esc = (value) => String(value ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 var token = localStorage.getItem("rxpos.token") ?? "";
@@ -24,7 +30,7 @@ async function api(path, init = {}) {
       }
     });
   } catch {
-    throw new Error("No connection to the server \u2014 nothing has been recorded. Try again when the signal returns.");
+    throw new NoConnection();
   }
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -112,7 +118,7 @@ function renderLogin() {
       token = body.token;
       localStorage.setItem("rxpos.token", token);
       session = body;
-      await localPut("session", { at: Date.now(), session: body }).catch(() => {
+      await localPut(LOCAL_STORE, "session", { at: Date.now(), session: body }).catch(() => {
       });
       branchId = body.branches[0]?.branch_id ?? "";
       view = "counter";
@@ -154,6 +160,7 @@ function renderApp() {
       <nav class="tabs">${tabs.map((t) => `<button data-tab="${t.id}" class="${view === t.id ? "on" : ""}">${t.label}</button>`).join("")}</nav>
       <div class="ctx">
         <label>Branch <select id="branchSel">${session.branches.map((b) => `<option value="${b.branch_id}"${b.branch_id === branchId ? " selected" : ""}>${esc(b.name)}</option>`).join("")}</select></label>
+        <button class="btn sm ghost" id="syncNow" style="display:none"></button>
         <button class="btn sm ghost" id="signOut">Sign out</button>
       </div>
     </header>
@@ -161,6 +168,8 @@ function renderApp() {
     <main id="main"></main>
   </div>`;
   byId("signOut").addEventListener("click", signOut);
+  byId("syncNow").addEventListener("click", () => void showQueue());
+  void renderQueueBadge();
   byId("branchSel").addEventListener("change", (event) => {
     branchId = event.target.value;
     cart = [];
@@ -401,11 +410,16 @@ async function completeSale() {
   if (!cart.length) return;
   const method = byId("method").value;
   const tendered = Math.round(Number(byId("tender").value || 0) * 100);
+  const saleId = newSaleId();
+  if (method !== "Cash" && !navigator.onLine) {
+    toast("Card and mobile money need the connection. Take cash, or wait for the signal.", true);
+    return;
+  }
   try {
     const result = await api("/api/sales", {
       method: "POST",
       body: JSON.stringify({
-        saleId: newSaleId(),
+        saleId,
         branchId,
         lines: cart.map((line) => ({ productId: line.productId, quantity: line.quantity })),
         paymentMethod: method,
@@ -414,12 +428,7 @@ async function completeSale() {
         prescriptionId
       })
     });
-    cart = [];
-    discountPesewas = 0;
-    prescriptionId = null;
-    prescriptionLabel = "";
-    renderCart();
-    void loadProducts();
+    clearCartAfterSale();
     if ((method === "Card" || method === "Mobile Money") && session?.payments?.enabled) {
       const paid = await chargeForSale(result.receipt, method === "Card" ? "card" : "mobile_money");
       if (!paid) {
@@ -429,8 +438,39 @@ async function completeSale() {
     }
     showReceipt(result.receipt);
   } catch (err) {
-    toast(err instanceof Error ? err.message : "The sale could not be completed", true);
+    if (!(err instanceof NoConnection) || method !== "Cash" || !session) {
+      toast(err instanceof Error ? err.message : "The sale could not be completed", true);
+      return;
+    }
+    const kept = {
+      saleId,
+      tenantId: session.tenant.id,
+      branchId,
+      lines: cart.map((line) => ({
+        productId: line.productId,
+        quantity: line.quantity,
+        name: line.name,
+        price: line.price
+      })),
+      discountPesewas: cartTotals().discount,
+      amountTenderedPesewas: tendered,
+      prescriptionId,
+      queuedAt: Date.now()
+    };
+    await queueSale(kept);
+    const waiting = (await myQueue()).length;
+    clearCartAfterSale();
+    void renderQueueBadge();
+    showQueuedSale(kept, waiting);
   }
+}
+function clearCartAfterSale() {
+  cart = [];
+  discountPesewas = 0;
+  prescriptionId = null;
+  prescriptionLabel = "";
+  renderCart();
+  void loadProducts();
 }
 async function chargeForSale(receipt, channel) {
   let charge;
@@ -725,23 +765,26 @@ document.addEventListener("keydown", (event) => {
 });
 var LOCAL_DB = "rxpos";
 var LOCAL_STORE = "products";
+var QUEUE_STORE = "queue";
+var LOCAL_VERSION = 2;
 function openLocal() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(LOCAL_DB, 1);
+    const request = indexedDB.open(LOCAL_DB, LOCAL_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(LOCAL_STORE)) db.createObjectStore(LOCAL_STORE);
+      if (!db.objectStoreNames.contains(QUEUE_STORE)) db.createObjectStore(QUEUE_STORE, { keyPath: "saleId" });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
 }
-async function localPut(key, value) {
+async function localPut(store, key, value) {
   const db = await openLocal();
   try {
     await new Promise((resolve, reject) => {
-      const tx = db.transaction(LOCAL_STORE, "readwrite");
-      tx.objectStore(LOCAL_STORE).put(value, key);
+      const tx = db.transaction(store, "readwrite");
+      tx.objectStore(store).put(value, key);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
@@ -749,14 +792,53 @@ async function localPut(key, value) {
     db.close();
   }
 }
-async function localGet(key) {
+async function localPutKeyed(store, value) {
+  const db = await openLocal();
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(store, "readwrite");
+      tx.objectStore(store).put(value);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+async function localGet(store, key) {
   const db = await openLocal();
   try {
     return await new Promise((resolve, reject) => {
-      const tx = db.transaction(LOCAL_STORE, "readonly");
-      const request = tx.objectStore(LOCAL_STORE).get(key);
+      const tx = db.transaction(store, "readonly");
+      const request = tx.objectStore(store).get(key);
       request.onsuccess = () => resolve(request.result ?? null);
       request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+async function localAll(store) {
+  const db = await openLocal();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(store, "readonly");
+      const request = tx.objectStore(store).getAll();
+      request.onsuccess = () => resolve(request.result ?? []);
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+async function localDelete(store, key) {
+  const db = await openLocal();
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(store, "readwrite");
+      tx.objectStore(store).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
     });
   } finally {
     db.close();
@@ -766,10 +848,10 @@ var catalogueKey = (forBranch) => `catalogue:${forBranch}`;
 async function rememberProducts(forBranch, rows) {
   if (!rows.length) return;
   const key = catalogueKey(forBranch);
-  const held = await localGet(key) ?? { at: 0, byId: {} };
+  const held = await localGet(LOCAL_STORE, key) ?? { at: 0, byId: {} };
   for (const row of rows) held.byId[row.product_id] = row;
   held.at = Date.now();
-  await localPut(key, held);
+  await localPut(LOCAL_STORE, key, held);
 }
 function searchLocally(held, query2) {
   const rows = Object.values(held.byId);
@@ -788,7 +870,7 @@ async function productsFor(forBranch, query2 = "", limit = 25) {
     });
     return { products: data.products, cachedAt: null };
   } catch (err) {
-    const held = await localGet(catalogueKey(forBranch)).catch(() => null);
+    const held = await localGet(LOCAL_STORE, catalogueKey(forBranch)).catch(() => null);
     if (!held || !Object.keys(held.byId).length) throw err;
     return { products: searchLocally(held, query2), cachedAt: held.at };
   }
@@ -813,6 +895,123 @@ function noteFreshness(cachedAt) {
   }
   bar.className = "netbar";
   bar.textContent = `Offline \u2014 stock as it was ${agoWords(cachedAt)}. Sales cannot be taken until the connection returns.`;
+}
+async function queueSale(sale) {
+  await localPutKeyed(QUEUE_STORE, sale);
+}
+async function queuedSales() {
+  const all = await localAll(QUEUE_STORE).catch(() => []);
+  return all.sort((a, b) => a.queuedAt - b.queuedAt);
+}
+async function myQueue() {
+  if (!session) return [];
+  return (await queuedSales()).filter((sale) => sale.tenantId === session?.tenant.id);
+}
+var syncing = false;
+async function syncQueue() {
+  if (syncing || !navigator.onLine || !session) return;
+  const waiting = (await myQueue()).filter((sale) => !sale.problem);
+  if (!waiting.length) {
+    void renderQueueBadge();
+    return;
+  }
+  syncing = true;
+  let sent = 0;
+  try {
+    for (const sale of waiting) {
+      try {
+        await api("/api/sales", {
+          method: "POST",
+          body: JSON.stringify({
+            saleId: sale.saleId,
+            branchId: sale.branchId,
+            lines: sale.lines.map((line) => ({ productId: line.productId, quantity: line.quantity })),
+            paymentMethod: "Cash",
+            amountTenderedPesewas: sale.amountTenderedPesewas,
+            discountPesewas: sale.discountPesewas,
+            prescriptionId: sale.prescriptionId
+          })
+        });
+        await localDelete(QUEUE_STORE, sale.saleId);
+        sent += 1;
+      } catch (err) {
+        if (err instanceof NoConnection) break;
+        await localPutKeyed(QUEUE_STORE, {
+          ...sale,
+          problem: err instanceof Error ? err.message : "The server refused this sale"
+        });
+      }
+    }
+  } finally {
+    syncing = false;
+  }
+  if (sent) {
+    toast(`${sent} offline sale${sent === 1 ? "" : "s"} sent`);
+    void loadProducts();
+  }
+  void renderQueueBadge();
+}
+async function renderQueueBadge() {
+  const button = document.getElementById("syncNow");
+  if (!button) return;
+  const waiting = await myQueue();
+  if (!waiting.length) {
+    button.style.display = "none";
+    return;
+  }
+  const stuck = waiting.filter((sale) => sale.problem).length;
+  button.style.display = "";
+  button.className = stuck ? "btn sm danger" : "btn sm ghost";
+  button.textContent = stuck ? `${waiting.length} waiting \xB7 ${stuck} needs attention` : `${waiting.length} waiting to send`;
+}
+async function showQueue() {
+  const waiting = await myQueue();
+  if (!waiting.length) {
+    toast("Nothing waiting to send");
+    return;
+  }
+  const stuck = waiting.filter((sale) => sale.problem);
+  openModal(`<h2>${waiting.length} sale${waiting.length === 1 ? "" : "s"} waiting to send</h2>
+    <p style="color:var(--muted);font-size:13px;margin:-6px 0 12px">
+      ${navigator.onLine ? "Sending now. Anything that cannot be sent is kept here with the reason." : "There is no connection yet. They will be sent when it returns."}
+    </p>
+    <table><thead><tr><th>When</th><th>Items</th><th class="num">Total</th><th></th></tr></thead><tbody>
+      ${waiting.map((sale) => {
+    const total = sale.lines.reduce((sum, line) => sum + line.price * line.quantity, 0) - sale.discountPesewas;
+    return `<tr>
+            <td>${esc(new Date(sale.queuedAt).toLocaleString())}</td>
+            <td>${sale.lines.reduce((sum, line) => sum + line.quantity, 0)} item(s)</td>
+            <td class="num">${money(total)}</td>
+            <td>${sale.problem ? `<span class="badge b-out">needs attention</span><br><span style="font-size:11.5px;color:var(--muted)">${esc(sale.problem)}</span>` : `<span class="badge b-mute">waiting</span>`}</td>
+          </tr>`;
+  }).join("")}
+    </tbody></table>
+    <div class="foot">
+      <button class="btn ghost" id="queueClose">Close</button>
+      <button class="btn primary" id="queueSync">Send now</button>
+    </div>`);
+  byId("queueClose").addEventListener("click", closeModal);
+  byId("queueSync").addEventListener("click", async () => {
+    await syncQueue();
+    closeModal();
+  });
+}
+function showQueuedSale(sale, waiting) {
+  const total = sale.lines.reduce((sum, line) => sum + line.price * line.quantity, 0) - sale.discountPesewas;
+  openModal(`<h2>Sale saved on this device</h2>
+    <p style="color:var(--muted);font-size:13px;margin:-6px 0 12px">
+      There is no connection, so this has not reached the server. It will be sent on its own \u2014
+      ${waiting} sale${waiting === 1 ? "" : "s"} waiting.
+    </p>
+    <table><tbody>
+      ${sale.lines.map(
+    (line) => `<tr><td>${esc(line.name)}</td><td class="num">${line.quantity}</td><td class="num">${money(line.price * line.quantity)}</td></tr>`
+  ).join("")}
+    </tbody></table>
+    <div class="tline grand" style="margin-top:10px"><span>Total</span><span>${money(total)}</span></div>
+    <div class="note">The batch numbers and the final receipt come from the server, so that follows once this is sent.</div>
+    <div class="foot"><button class="btn primary" id="queuedOk">Done</button></div>`);
+  byId("queuedOk").addEventListener("click", closeModal);
 }
 var PRODUCT_FORMS = ["Tablets", "Capsules", "Syrup", "Suspension", "Injection", "Sachet", "Cream", "Ointment", "Drops", "Inhaler", "Device", "Other"];
 function toPesewas(value) {
@@ -1256,20 +1455,25 @@ async function boot() {
     navigator.serviceWorker.register("/sw.js").catch(() => {
     });
   }
-  window.addEventListener("online", () => noteFreshness(null));
+  window.addEventListener("online", () => {
+    noteFreshness(null);
+    void syncQueue();
+  });
+  window.setInterval(() => void syncQueue(), 2e4);
   if (!token) {
     renderLogin();
     return;
   }
   try {
     session = await api("/api/session");
-    await localPut("session", { at: Date.now(), session }).catch(() => {
+    await localPut(LOCAL_STORE, "session", { at: Date.now(), session }).catch(() => {
     });
     branchId = session.branches[0]?.branch_id ?? "";
     renderApp();
+    void syncQueue();
     return;
   } catch {
-    const held = await localGet("session").catch(() => null);
+    const held = await localGet(LOCAL_STORE, "session").catch(() => null);
     if (held?.session) {
       session = held.session;
       branchId = session.branches[0]?.branch_id ?? "";
