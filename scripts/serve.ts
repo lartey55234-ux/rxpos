@@ -13,6 +13,7 @@ import { openMigratedDatabase } from "../src/storage/index.ts";
 import { seedPlans } from "../src/auth.ts";
 import { seedDemoPharmacy } from "../src/demo.ts";
 import { startServer } from "../src/server.ts";
+import { ConsoleMailer, ResendMailer } from "../src/mail.ts";
 
 const config = loadConfig();
 
@@ -27,8 +28,11 @@ await seedPlans(db);
 const tenants = (await db.get<{ n: number }>("SELECT COUNT(*) AS n FROM tenants"))?.n ?? 0;
 const demo = config.seedDemo && tenants === 0 ? await seedDemoPharmacy(db) : null;
 
+const mailer = config.resendApiKey ? new ResendMailer(config.resendApiKey, config.mailFrom) : new ConsoleMailer();
 const server = await startServer(db, config.port, undefined, config.host, {
   paystackSecretKey: config.paystackSecretKey,
+  publicUrl: config.publicUrl,
+  mailer,
 });
 
 console.log(`[rxpos] listening on http://${config.host}:${config.port}`);
@@ -36,6 +40,10 @@ console.log(`[rxpos] database  ${describeDatabase(config.databaseUrl)}`);
 console.log(
   `[rxpos] payments  ${config.paystackSecretKey ? "card and mobile money on" : "off — no PAYSTACK_SECRET_KEY"}`,
 );
+console.log(
+  `[rxpos] email     ${mailer.delivers ? `sending as ${config.mailFrom}` : "printed to this log — no RESEND_API_KEY"}`,
+);
+console.log(`[rxpos] links     ${config.publicUrl}`);
 if (demo) {
   console.log(`[rxpos] seeded the sample pharmacy — ${demo.credentials.owner} / ${demo.credentials.password}`);
 } else if (tenants > 0) {

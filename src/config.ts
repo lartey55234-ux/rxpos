@@ -17,6 +17,10 @@ export type Config = {
   seedDemo: boolean;
   /** Absent means card and mobile money are not offered. */
   paystackSecretKey: string | null;
+  /** Where the app answers, so reset links point at the right place. */
+  publicUrl: string;
+  resendApiKey: string | null;
+  mailFrom: string;
   production: boolean;
 };
 
@@ -45,6 +49,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     // A hosted demo wants the sample pharmacy; a real instance must not invent one.
     seedDemo: flag(env.SEED_DEMO, !production),
     paystackSecretKey: env.PAYSTACK_SECRET_KEY?.trim() || null,
+    publicUrl: (env.PUBLIC_URL ?? `http://localhost:${port}`).replace(/\/+$/, ""),
+    resendApiKey: env.RESEND_API_KEY?.trim() || null,
+    mailFrom: env.MAIL_FROM?.trim() || "rxpos <onboarding@resend.dev>",
     production,
   };
 }

@@ -161,7 +161,7 @@ function debounce<T extends (...args: never[]) => void>(fn: T, ms: number): T {
 
 /* ------------------------------- login ------------------------------- */
 
-type AuthMode = "signin" | "signup";
+type AuthMode = "signin" | "signup" | "forgot";
 let authMode: AuthMode = "signin";
 
 const PLANS = [
@@ -170,6 +170,76 @@ const PLANS = [
   { id: "standard", label: "Standard — GHS 100/month" },
   { id: "pro", label: "Pro — GHS 150/month" },
 ];
+
+function forgotCard(): string {
+  return `<div class="login"><div class="card">
+    <h1>Forgot your password?</h1>
+    <p>Enter the email you sign in with, and we will send a link to choose a new one.</p>
+    <div class="fld"><label>Email</label><input id="email" type="email" autocomplete="username"></div>
+    <button class="btn primary" id="submit" style="width:100%;margin-top:16px">Send the link</button>
+    <button class="btn ghost" id="swap" style="width:100%;margin-top:8px">Back to sign in</button>
+  </div></div>`;
+}
+
+/**
+ * Where an emailed reset link lands. This runs before anything else, because
+ * whoever followed the link is not signed in — that is rather the point.
+ */
+async function renderReset(token: string): Promise<void> {
+  byId("app").innerHTML = `<div class="login"><div class="card"><div class="empty">Checking that link…</div></div></div>`;
+
+  let check: { valid: boolean; reason: string | null };
+  try {
+    check = await api<{ valid: boolean; reason: string | null }>(
+      `/api/password/reset?token=${encodeURIComponent(token)}`,
+    );
+  } catch (err) {
+    check = { valid: false, reason: err instanceof Error ? err.message : "Could not check that link." };
+  }
+
+  const backToSignIn = (): void => {
+    history.replaceState(null, "", "/");
+    authMode = "signin";
+    renderLogin();
+  };
+
+  if (!check.valid) {
+    byId("app").innerHTML = `<div class="login"><div class="card">
+      <h1>That link cannot be used</h1>
+      <p>${esc(check.reason ?? "Ask for a new one.")}</p>
+      <button class="btn primary" id="toLogin" style="width:100%">Back to sign in</button>
+    </div></div>`;
+    byId("toLogin").addEventListener("click", backToSignIn);
+    return;
+  }
+
+  byId("app").innerHTML = `<div class="login"><div class="card">
+    <h1>Choose a new password</h1>
+    <p>The link works once, and anything already signed in with the old password is signed out.</p>
+    <div class="fld"><label>New password</label><input id="newPassword" type="password" autocomplete="new-password"></div>
+    <div class="fld" style="margin-top:10px"><label>Type it again</label><input id="againPassword" type="password" autocomplete="new-password"></div>
+    <button class="btn primary" id="submit" style="width:100%;margin-top:16px">Set the password</button>
+  </div></div>`;
+
+  const submit = async (): Promise<void> => {
+    const password = (byId("newPassword") as HTMLInputElement).value;
+    if (password !== (byId("againPassword") as HTMLInputElement).value) {
+      toast("Those two do not match", true);
+      return;
+    }
+    try {
+      await api("/api/password/reset", { method: "POST", body: JSON.stringify({ token, password }) });
+      backToSignIn();
+      toast("Password changed — sign in with the new one");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not set the password", true);
+    }
+  };
+  byId("submit").addEventListener("click", () => void submit());
+  byId("againPassword").addEventListener("keydown", (event) => {
+    if ((event as KeyboardEvent).key === "Enter") void submit();
+  });
+}
 
 function renderLogin(): void {
   byId("app").innerHTML =
@@ -181,8 +251,11 @@ function renderLogin(): void {
           <div class="fld" style="margin-top:10px"><label>Password</label><input id="password" type="password" autocomplete="current-password"></div>
           <button class="btn primary" id="submit" style="width:100%;margin-top:16px">Sign in</button>
           <button class="btn ghost" id="swap" style="width:100%;margin-top:8px">New pharmacy? Create an account</button>
+          <button class="btn ghost" id="forgot" style="width:100%;margin-top:8px">Forgot your password?</button>
         </div></div>`
-      : `<div class="login wide"><div class="card">
+      : authMode === "forgot"
+        ? forgotCard()
+        : `<div class="login wide"><div class="card">
           <h1>Create your pharmacy</h1>
           <p>You can add staff and stock as soon as you are in.</p>
           <div class="fld"><label>Pharmacy name</label><input id="pharmacyName" type="text" autocomplete="organization"></div>
@@ -199,6 +272,30 @@ function renderLogin(): void {
         </div></div>`;
 
   const submit = async (): Promise<void> => {
+    if (authMode === "forgot") {
+      const email = (byId("email") as HTMLInputElement).value;
+      try {
+        const body = await api<{ message: string }>("/api/password/forgot", {
+          method: "POST",
+          body: JSON.stringify({ email }),
+        });
+        // The same wording whether or not the address is known, so this screen
+        // cannot be used to find out who works at a pharmacy.
+        byId("app").innerHTML = `<div class="login"><div class="card">
+          <h1>Check your email</h1>
+          <p>${esc(body.message)}</p>
+          <button class="btn primary" id="toLogin" style="width:100%">Back to sign in</button>
+        </div></div>`;
+        byId("toLogin").addEventListener("click", () => {
+          authMode = "signin";
+          renderLogin();
+        });
+      } catch (err) {
+        toast(err instanceof Error ? err.message : "Could not send the link", true);
+      }
+      return;
+    }
+
     const signingIn = authMode === "signin";
     const email = (byId("email") as HTMLInputElement).value;
     const password = (byId("password") as HTMLInputElement).value;
@@ -237,9 +334,20 @@ function renderLogin(): void {
     authMode = authMode === "signin" ? "signup" : "signin";
     renderLogin();
   });
-  byId("password").addEventListener("keydown", (event) => {
-    if ((event as KeyboardEvent).key === "Enter") void submit();
-  });
+  const forgot = document.getElementById("forgot");
+  if (forgot) {
+    forgot.addEventListener("click", () => {
+      authMode = "forgot";
+      renderLogin();
+    });
+  }
+  // The forgot screen has no password field, so this cannot assume one.
+  const passwordField = document.getElementById("password");
+  if (passwordField) {
+    passwordField.addEventListener("keydown", (event) => {
+      if ((event as KeyboardEvent).key === "Enter") void submit();
+    });
+  }
 }
 
 /* -------------------------------- shell ------------------------------- */
@@ -1874,6 +1982,14 @@ async function boot(): Promise<void> {
   // While anything is waiting, keep trying: a connection can come back without the
   // browser announcing it.
   window.setInterval(() => void syncQueue(), 20000);
+
+  // Somebody followed a link out of their email. They are not signed in, and must
+  // not need to be. This comes before anything else, because it is the whole point.
+  const resetToken = new URLSearchParams(window.location.search).get("reset");
+  if (resetToken) {
+    await renderReset(resetToken);
+    return;
+  }
 
   if (!token) {
     renderLogin();

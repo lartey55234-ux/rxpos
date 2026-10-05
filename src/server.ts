@@ -27,6 +27,8 @@ import {
 import { assetValues, salesSummary, todayTotals, topProducts } from "./reports.ts";
 import { importCatalogue, type ImportField } from "./import.ts";
 import { confirmCharge, paymentState, startCharge } from "./checkout.ts";
+import { checkResetToken, requestPasswordReset, resetPassword } from "./password.ts";
+import { ConsoleMailer, MailError, type Mailer } from "./mail.ts";
 import { PaystackGateway, verifyWebhookSignature, type Channel, type PaymentGateway } from "./payments.ts";
 import { ValidationError } from "./util.ts";
 import type { Actor } from "./actor.ts";
@@ -149,6 +151,10 @@ export type HandlerOptions = {
   /** Absent, or null, means card and mobile money are not offered. */
   gateway?: PaymentGateway | null;
   paystackSecretKey?: string | null;
+  /** Where the app answers, so reset links point at the right place. */
+  publicUrl?: string;
+  /** Falls back to writing messages to the log. */
+  mailer?: Mailer;
 };
 
 export function createRequestHandler(
@@ -166,6 +172,11 @@ export function createRequestHandler(
         ? new PaystackGateway(secretKey)
         : null;
 
+  const mailer = options.mailer ?? new ConsoleMailer();
+  const publicUrl = options.publicUrl ?? "http://localhost:4173";
+
+  // A reset endpoint is a way to send mail to strangers. Keep it tight.
+  const forgotLimiter = new RateLimiter(5, 60 * 60 * 1000);
   const loginLimiter = new RateLimiter(options.loginLimit ?? 30, 15 * 60 * 1000);
   const signupLimiter = new RateLimiter(options.signupLimit ?? 5, 60 * 60 * 1000);
 
@@ -226,6 +237,34 @@ export function createRequestHandler(
           }
         }
         send(res, 200, { received: true });
+        return;
+      }
+
+      /* ------------------------- getting back in ------------------------- */
+
+      if (method === "POST" && path === "/api/password/forgot") {
+        forgotLimiter.hit(clientKey(req));
+        const body = await readJson(req);
+        // The same answer whether or not the address is known: anything else would
+        // be a way to find out who works at a pharmacy.
+        try {
+          await requestPasswordReset(db, mailer, publicUrl, str(body.email));
+        } catch (err) {
+          console.error("[rxpos] password reset email:", err);
+        }
+        send(res, 200, { ok: true, message: "If that address has an account, a reset link is on its way." });
+        return;
+      }
+
+      if (method === "GET" && path === "/api/password/reset") {
+        send(res, 200, await checkResetToken(db, url.searchParams.get("token") ?? ""));
+        return;
+      }
+
+      if (method === "POST" && path === "/api/password/reset") {
+        const body = await readJson(req);
+        const result = await resetPassword(db, str(body.token), str(body.password));
+        send(res, 200, { email: result.email });
         return;
       }
 

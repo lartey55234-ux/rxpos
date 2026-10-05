@@ -70,6 +70,18 @@ CREATE TABLE IF NOT EXISTS sessions (
   revoked_at   TEXT
 );
 
+-- A forgotten password. The token is stored hashed, because a leaked reset token
+-- is a way into somebody's pharmacy. Single use, and it expires.
+CREATE TABLE IF NOT EXISTS password_resets (
+  reset_id    TEXT PRIMARY KEY,
+  tenant_id   TEXT NOT NULL REFERENCES tenants(tenant_id),
+  user_id     TEXT NOT NULL REFERENCES users(user_id),
+  token_hash  TEXT NOT NULL UNIQUE,
+  created_at  TEXT NOT NULL,
+  expires_at  TEXT NOT NULL,
+  used_at     TEXT
+);
+
 CREATE TABLE IF NOT EXISTS categories (
   category_id  TEXT PRIMARY KEY,
   tenant_id    TEXT NOT NULL REFERENCES tenants(tenant_id),
@@ -286,3 +298,5 @@ CREATE INDEX IF NOT EXISTS idx_register_tenant        ON controlled_register(ten
 
 CREATE INDEX IF NOT EXISTS idx_intents_tenant  ON payment_intents(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_intents_ref     ON payment_intents(reference);
+
+CREATE INDEX IF NOT EXISTS idx_resets_token ON password_resets(token_hash);
