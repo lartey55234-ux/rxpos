@@ -212,11 +212,21 @@ export async function paymentState(actor: Actor, saleId: string): Promise<{ paid
   return { paid: intent.status === "confirmed", reference: intent.reference, status: intent.status };
 }
 
+/** Domains Paystack refuses outright. */
+const RESERVED_EMAIL = /\.(example|local|localhost|invalid|test)$/i;
+
 /**
  * Paystack wants an email on the transaction. The pharmacy's own is the right
- * one: it is the account the money lands in, and the receipt goes there.
+ * one — it is the account the money lands in.
+ *
+ * But Paystack rejects reserved domains, and the sample pharmacy uses one, so a
+ * charge on the demo would fail with "Invalid Email Address Passed" before the
+ * customer ever saw a payment screen. A charge matters more than a tidy address.
  */
 async function payerEmail(actor: Actor): Promise<string> {
   const tenant = await actor.scope.tenant<{ email: string | null }>();
-  return tenant.email ?? `pharmacy-${actor.scope.tenantId.slice(0, 8)}@rxpos.local`;
+  const email = (tenant.email ?? "").trim();
+  if (email && !RESERVED_EMAIL.test(email)) return email;
+  const safe = actor.scope.tenantId.replace(/[^a-z0-9]/gi, "").slice(0, 12);
+  return `pharmacy-${safe}@example.com`;
 }

@@ -144,6 +144,8 @@ export function verifyWebhookSignature(rawBody: string, signature: string, secre
 export class FakeGateway implements PaymentGateway {
   readonly name = "fake";
   private readonly transactions = new Map<string, VerifiedTransaction>();
+  /** What initialize was called with, so tests can assert on it. */
+  readonly initialised: { email: string; amountPesewas: number; reference: string }[] = [];
 
   /** Pretend the customer paid. */
   succeed(reference: string, amountPesewas: number, channel = "card"): void {
@@ -172,6 +174,11 @@ export class FakeGateway implements PaymentGateway {
     reference: string;
     channels: Channel[];
   }): Promise<InitialisedTransaction> {
+    this.initialised.push({
+      email: input.email,
+      amountPesewas: input.amountPesewas,
+      reference: input.reference,
+    });
     return {
       reference: input.reference,
       accessCode: `fake_${input.reference}`,

@@ -78,6 +78,20 @@ test("a charge takes its amount from the sale, not from the caller", async () =>
   assert.equal(state.status, "pending");
 });
 
+test("a pharmacy whose email Paystack would refuse still gets a working charge", async () => {
+  // The sample pharmacy uses a .example address, which Paystack rejects outright.
+  const f = await signedIn();
+  await f.owner.scope.run("UPDATE tenants SET email = ? WHERE tenant_id = {{tenant}}", "owner@osupharmacy.example");
+
+  const before = gateway.initialised.length;
+  await startCharge(f.owner, gateway, { saleId: f.sale.saleId, channel: "card" });
+
+  const sent = gateway.initialised[before];
+  assert.ok(sent, "initialize was not called");
+  assert.doesNotMatch(sent.email, /\.(example|local|invalid|test)$/i, "a reserved domain would be refused by Paystack");
+  assert.match(sent.email, /@example\.com$/, "the stand-in must still be a usable address");
+});
+
 test("a charge is not started twice for the same sale", async () => {
   const f = await signedIn();
   const first = await startCharge(f.owner, gateway, { saleId: f.sale.saleId, channel: "card" });
