@@ -27,10 +27,15 @@ await seedPlans(db);
 const tenants = (await db.get<{ n: number }>("SELECT COUNT(*) AS n FROM tenants"))?.n ?? 0;
 const demo = config.seedDemo && tenants === 0 ? await seedDemoPharmacy(db) : null;
 
-const server = await startServer(db, config.port, undefined, config.host);
+const server = await startServer(db, config.port, undefined, config.host, {
+  paystackSecretKey: config.paystackSecretKey,
+});
 
 console.log(`[rxpos] listening on http://${config.host}:${config.port}`);
 console.log(`[rxpos] database  ${describeDatabase(config.databaseUrl)}`);
+console.log(
+  `[rxpos] payments  ${config.paystackSecretKey ? "card and mobile money on" : "off — no PAYSTACK_SECRET_KEY"}`,
+);
 if (demo) {
   console.log(`[rxpos] seeded the sample pharmacy — ${demo.credentials.owner} / ${demo.credentials.password}`);
 } else if (tenants > 0) {
