@@ -90,14 +90,21 @@ let query = "";
 let products: ProductRow[] = [];
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(path, {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-      ...(init.headers ?? {}),
-    },
-  });
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      ...init,
+      headers: {
+        "content-type": "application/json",
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(init.headers ?? {}),
+      },
+    });
+  } catch {
+    // "Failed to fetch" is what the browser says. A cashier needs to know what it
+    // means for the sale in front of them.
+    throw new Error("No connection to the server — nothing has been recorded. Try again when the signal returns.");
+  }
   const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (!res.ok) {
     if (res.status === 401) signOut();
@@ -202,6 +209,9 @@ function renderLogin(): void {
       token = body.token;
       localStorage.setItem("rxpos.token", token);
       session = body;
+      // Keep the session on the device, so the network going away later is not a
+      // sign-out. Without this the till is unusable the moment the internet blinks.
+      await localPut("session", { at: Date.now(), session: body }).catch(() => {});
       branchId = body.branches[0]?.branch_id ?? "";
       view = "counter";
       renderApp();
@@ -254,6 +264,7 @@ function renderApp(): void {
         <button class="btn sm ghost" id="signOut">Sign out</button>
       </div>
     </header>
+    <div class="netbar hidden" id="netbar"></div>
     <main id="main"></main>
   </div>`;
 
@@ -272,6 +283,7 @@ function renderApp(): void {
   });
 
   renderView();
+  noteFreshness(offlineSince);
 }
 
 function renderView(): void {
@@ -349,10 +361,9 @@ async function loadProducts(): Promise<void> {
   const box = document.getElementById("results");
   if (!box) return;
   try {
-    const data = await api<{ products: ProductRow[] }>(
-      `/api/products?branchId=${encodeURIComponent(branchId)}&q=${encodeURIComponent(query)}`,
-    );
-    products = data.products;
+    const { products: found, cachedAt } = await productsFor(branchId, query);
+    noteFreshness(cachedAt);
+    products = found;
     if (!products.length) {
       box.innerHTML = `<div class="empty">No product matches "${esc(query)}"</div>`;
       return;
@@ -921,6 +932,135 @@ document.addEventListener("keydown", (event) => {
   if ((event as KeyboardEvent).key === "Escape") closeModal();
 });
 
+/* ------------------------- working with no network ------------------------ */
+
+/**
+ * The catalogue as last seen, kept in IndexedDB.
+ *
+ * Stock figures go stale the moment they are written, so this is only ever used
+ * to keep a cashier working, and whatever it returns is labelled with its age.
+ * The counter says so on screen rather than quietly showing old numbers.
+ */
+const LOCAL_DB = "rxpos";
+const LOCAL_STORE = "products";
+
+function openLocal(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(LOCAL_DB, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(LOCAL_STORE)) db.createObjectStore(LOCAL_STORE);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function localPut(key: string, value: unknown): Promise<void> {
+  const db = await openLocal();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(LOCAL_STORE, "readwrite");
+      tx.objectStore(LOCAL_STORE).put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function localGet<T>(key: string): Promise<T | null> {
+  const db = await openLocal();
+  try {
+    return await new Promise<T | null>((resolve, reject) => {
+      const tx = db.transaction(LOCAL_STORE, "readonly");
+      const request = tx.objectStore(LOCAL_STORE).get(key);
+      request.onsuccess = () => resolve((request.result as T) ?? null);
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+type LocalCatalogue = { at: number; byId: Record<string, ProductRow> };
+
+const catalogueKey = (forBranch: string): string => `catalogue:${forBranch}`;
+
+/** Keep every product we have seen, so a search offline has something to search. */
+async function rememberProducts(forBranch: string, rows: ProductRow[]): Promise<void> {
+  if (!rows.length) return;
+  const key = catalogueKey(forBranch);
+  const held = (await localGet<LocalCatalogue>(key)) ?? { at: 0, byId: {} };
+  for (const row of rows) held.byId[row.product_id] = row;
+  held.at = Date.now();
+  await localPut(key, held);
+}
+
+function searchLocally(held: LocalCatalogue, query: string): ProductRow[] {
+  const rows = Object.values(held.byId);
+  const needle = query.trim().toLowerCase();
+  const matching = needle
+    ? rows.filter(
+        (row) =>
+          row.name.toLowerCase().includes(needle) ||
+          (row.barcode ?? "").toLowerCase().includes(needle) ||
+          (row.brand ?? "").toLowerCase().includes(needle),
+      )
+    : rows;
+  return matching.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Products for a branch, from the server if it answers and from the cache if it
+ * does not. `cachedAt` is null when the figures came from the server, so the
+ * caller can say plainly which it is holding.
+ */
+async function productsFor(
+  forBranch: string,
+  query = "",
+  limit = 25,
+): Promise<{ products: ProductRow[]; cachedAt: number | null }> {
+  try {
+    const data = await api<{ products: ProductRow[] }>(
+      `/api/products?branchId=${encodeURIComponent(forBranch)}&q=${encodeURIComponent(query)}&limit=${limit}`,
+    );
+    await rememberProducts(forBranch, data.products).catch(() => {});
+    return { products: data.products, cachedAt: null };
+  } catch (err) {
+    const held = await localGet<LocalCatalogue>(catalogueKey(forBranch)).catch(() => null);
+    if (!held || !Object.keys(held.byId).length) throw err;
+    return { products: searchLocally(held, query), cachedAt: held.at };
+  }
+}
+
+/** How long ago, in words a cashier would use. */
+function agoWords(at: number): string {
+  const minutes = Math.max(0, Math.round((Date.now() - at) / 60000));
+  if (minutes < 1) return "a moment ago";
+  if (minutes === 1) return "a minute ago";
+  if (minutes < 60) return `${minutes} minutes ago`;
+  const hours = Math.round(minutes / 60);
+  return hours === 1 ? "an hour ago" : `${hours} hours ago`;
+}
+
+let offlineSince: number | null = null;
+
+/** Say plainly when the screen is working from cached figures. */
+function noteFreshness(cachedAt: number | null): void {
+  offlineSince = cachedAt;
+  const bar = document.getElementById("netbar");
+  if (!bar) return;
+  if (cachedAt === null) {
+    bar.className = "netbar hidden";
+    bar.textContent = "";
+    return;
+  }
+  bar.className = "netbar";
+  bar.textContent = `Offline — stock as it was ${agoWords(cachedAt)}. Sales cannot be taken until the connection returns.`;
+}
+
 /* ------------------------------- catalogue ------------------------------ */
 
 const PRODUCT_FORMS = ["Tablets", "Capsules", "Syrup", "Suspension", "Injection", "Sachet", "Cream", "Ointment", "Drops", "Inhaler", "Device", "Other"];
@@ -968,9 +1108,9 @@ async function loadCatalogue(filter: string): Promise<void> {
   if (!box) return;
   const showCost = session?.permissions.assets ?? false;
   try {
-    const data = await api<{ products: ProductRow[] }>(
-      `/api/products?branchId=${encodeURIComponent(branchId)}&q=${encodeURIComponent(filter)}&limit=200`,
-    );
+    const { products: found, cachedAt } = await productsFor(branchId, filter, 200);
+    noteFreshness(cachedAt);
+    const data = { products: found };
     if (!data.products.length) {
       box.innerHTML = `<div class="empty">${filter ? "Nothing matches that filter." : "No products yet. Add the first one."}</div>`;
       return;
@@ -1452,17 +1592,39 @@ function renderImportReport(report: ImportReport, committed: boolean): void {
 }
 
 async function boot(): Promise<void> {
+  // Offline support is a bonus, never a requirement: if the browser refuses the
+  // service worker the counter still works exactly as it did.
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/sw.js").catch(() => {});
+  }
+  window.addEventListener("online", () => noteFreshness(null));
+
   if (!token) {
     renderLogin();
     return;
   }
+
   try {
     session = await api<Session>("/api/session");
+    await localPut("session", { at: Date.now(), session }).catch(() => {});
     branchId = session.branches[0]?.branch_id ?? "";
     renderApp();
+    return;
   } catch {
-    signOut();
+    // A network failure is not a signed-out cashier. Losing the till because the
+    // internet blinked would be worse than showing figures that might be stale, so
+    // fall back to the session we were last given — and only if there is none, or
+    // the server actively rejected the token, is this a sign-out.
+    const held = await localGet<{ at: number; session: Session }>("session").catch(() => null);
+    if (held?.session) {
+      session = held.session;
+      branchId = session.branches[0]?.branch_id ?? "";
+      renderApp();
+      noteFreshness(held.at);
+      return;
+    }
   }
+  signOut();
 }
 
 void boot();

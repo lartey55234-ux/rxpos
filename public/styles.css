@@ -65,6 +65,8 @@ h1,h2,h3{margin:0}
 .fld label{font-size:11.5px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
 .fld input,.fld select{border:1px solid var(--line);border-radius:9px;padding:8px 10px;background:#fcfcfe;width:100%}
 .inline{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.netbar{background:#fdf3e3;color:#8a5a00;border:1px solid #f0dfc0;border-radius:10px;padding:9px 12px;font-size:12.5px;font-weight:600;margin-bottom:12px}
+.netbar.hidden{display:none}
 .empty{color:var(--muted);font-size:13px;text-align:center;padding:22px 10px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);border-bottom:1px solid var(--line);padding:7px 8px}

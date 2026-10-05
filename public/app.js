@@ -13,14 +13,19 @@ var prescriptionLabel = "";
 var query = "";
 var products = [];
 async function api(path, init = {}) {
-  const res = await fetch(path, {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      ...token ? { authorization: `Bearer ${token}` } : {},
-      ...init.headers ?? {}
-    }
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      ...init,
+      headers: {
+        "content-type": "application/json",
+        ...token ? { authorization: `Bearer ${token}` } : {},
+        ...init.headers ?? {}
+      }
+    });
+  } catch {
+    throw new Error("No connection to the server \u2014 nothing has been recorded. Try again when the signal returns.");
+  }
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
     if (res.status === 401) signOut();
@@ -107,6 +112,8 @@ function renderLogin() {
       token = body.token;
       localStorage.setItem("rxpos.token", token);
       session = body;
+      await localPut("session", { at: Date.now(), session: body }).catch(() => {
+      });
       branchId = body.branches[0]?.branch_id ?? "";
       view = "counter";
       renderApp();
@@ -150,6 +157,7 @@ function renderApp() {
         <button class="btn sm ghost" id="signOut">Sign out</button>
       </div>
     </header>
+    <div class="netbar hidden" id="netbar"></div>
     <main id="main"></main>
   </div>`;
   byId("signOut").addEventListener("click", signOut);
@@ -166,6 +174,7 @@ function renderApp() {
     renderApp();
   });
   renderView();
+  noteFreshness(offlineSince);
 }
 function renderView() {
   if (view === "counter") renderCounter();
@@ -236,10 +245,9 @@ async function loadProducts() {
   const box = document.getElementById("results");
   if (!box) return;
   try {
-    const data = await api(
-      `/api/products?branchId=${encodeURIComponent(branchId)}&q=${encodeURIComponent(query)}`
-    );
-    products = data.products;
+    const { products: found, cachedAt } = await productsFor(branchId, query);
+    noteFreshness(cachedAt);
+    products = found;
     if (!products.length) {
       box.innerHTML = `<div class="empty">No product matches "${esc(query)}"</div>`;
       return;
@@ -715,6 +723,97 @@ document.addEventListener("click", (event) => {
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeModal();
 });
+var LOCAL_DB = "rxpos";
+var LOCAL_STORE = "products";
+function openLocal() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(LOCAL_DB, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(LOCAL_STORE)) db.createObjectStore(LOCAL_STORE);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+async function localPut(key, value) {
+  const db = await openLocal();
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(LOCAL_STORE, "readwrite");
+      tx.objectStore(LOCAL_STORE).put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+async function localGet(key) {
+  const db = await openLocal();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(LOCAL_STORE, "readonly");
+      const request = tx.objectStore(LOCAL_STORE).get(key);
+      request.onsuccess = () => resolve(request.result ?? null);
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+var catalogueKey = (forBranch) => `catalogue:${forBranch}`;
+async function rememberProducts(forBranch, rows) {
+  if (!rows.length) return;
+  const key = catalogueKey(forBranch);
+  const held = await localGet(key) ?? { at: 0, byId: {} };
+  for (const row of rows) held.byId[row.product_id] = row;
+  held.at = Date.now();
+  await localPut(key, held);
+}
+function searchLocally(held, query2) {
+  const rows = Object.values(held.byId);
+  const needle = query2.trim().toLowerCase();
+  const matching = needle ? rows.filter(
+    (row) => row.name.toLowerCase().includes(needle) || (row.barcode ?? "").toLowerCase().includes(needle) || (row.brand ?? "").toLowerCase().includes(needle)
+  ) : rows;
+  return matching.sort((a, b) => a.name.localeCompare(b.name));
+}
+async function productsFor(forBranch, query2 = "", limit = 25) {
+  try {
+    const data = await api(
+      `/api/products?branchId=${encodeURIComponent(forBranch)}&q=${encodeURIComponent(query2)}&limit=${limit}`
+    );
+    await rememberProducts(forBranch, data.products).catch(() => {
+    });
+    return { products: data.products, cachedAt: null };
+  } catch (err) {
+    const held = await localGet(catalogueKey(forBranch)).catch(() => null);
+    if (!held || !Object.keys(held.byId).length) throw err;
+    return { products: searchLocally(held, query2), cachedAt: held.at };
+  }
+}
+function agoWords(at) {
+  const minutes = Math.max(0, Math.round((Date.now() - at) / 6e4));
+  if (minutes < 1) return "a moment ago";
+  if (minutes === 1) return "a minute ago";
+  if (minutes < 60) return `${minutes} minutes ago`;
+  const hours = Math.round(minutes / 60);
+  return hours === 1 ? "an hour ago" : `${hours} hours ago`;
+}
+var offlineSince = null;
+function noteFreshness(cachedAt) {
+  offlineSince = cachedAt;
+  const bar = document.getElementById("netbar");
+  if (!bar) return;
+  if (cachedAt === null) {
+    bar.className = "netbar hidden";
+    bar.textContent = "";
+    return;
+  }
+  bar.className = "netbar";
+  bar.textContent = `Offline \u2014 stock as it was ${agoWords(cachedAt)}. Sales cannot be taken until the connection returns.`;
+}
 var PRODUCT_FORMS = ["Tablets", "Capsules", "Syrup", "Suspension", "Injection", "Sachet", "Cream", "Ointment", "Drops", "Inhaler", "Device", "Other"];
 function toPesewas(value) {
   const amount = Number(value);
@@ -745,9 +844,9 @@ async function loadCatalogue(filter) {
   if (!box) return;
   const showCost = session?.permissions.assets ?? false;
   try {
-    const data = await api(
-      `/api/products?branchId=${encodeURIComponent(branchId)}&q=${encodeURIComponent(filter)}&limit=200`
-    );
+    const { products: found, cachedAt } = await productsFor(branchId, filter, 200);
+    noteFreshness(cachedAt);
+    const data = { products: found };
     if (!data.products.length) {
       box.innerHTML = `<div class="empty">${filter ? "Nothing matches that filter." : "No products yet. Add the first one."}</div>`;
       return;
@@ -1153,16 +1252,32 @@ function renderImportReport(report, committed) {
   </div>`;
 }
 async function boot() {
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/sw.js").catch(() => {
+    });
+  }
+  window.addEventListener("online", () => noteFreshness(null));
   if (!token) {
     renderLogin();
     return;
   }
   try {
     session = await api("/api/session");
+    await localPut("session", { at: Date.now(), session }).catch(() => {
+    });
     branchId = session.branches[0]?.branch_id ?? "";
     renderApp();
+    return;
   } catch {
-    signOut();
+    const held = await localGet("session").catch(() => null);
+    if (held?.session) {
+      session = held.session;
+      branchId = session.branches[0]?.branch_id ?? "";
+      renderApp();
+      noteFreshness(held.at);
+      return;
+    }
   }
+  signOut();
 }
 void boot();
