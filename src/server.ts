@@ -342,6 +342,9 @@ export function createRequestHandler(
         const me = await actor();
         const body = await readJson(req);
         const result = await createSale(me, {
+          // The client's id for this sale, so a retry after a dropped connection is
+          // the same sale rather than a second one.
+          ...(body.saleId ? { saleId: String(body.saleId) } : {}),
           branchId: String(body.branchId ?? ""),
           lines: (body.lines as { productId: string; quantity: number }[]) ?? [],
           paymentMethod: (body.paymentMethod as "Cash" | "Mobile Money" | "Card") ?? "Cash",

@@ -10,6 +10,12 @@ import type { ControlledClass } from "./catalog.ts";
 export type SaleLineInput = { productId: string; quantity: number };
 
 export type SaleInput = {
+  /**
+   * The caller's id for this sale. The client mints it so that a retry after a
+   * dropped connection is recognisably the *same* sale rather than a second one.
+   * Omit it and the server generates one, which is what the tests and the seeder do.
+   */
+  saleId?: string;
   branchId: string;
   lines: SaleLineInput[];
   paymentMethod: "Cash" | "Mobile Money" | "Card";
@@ -79,11 +85,22 @@ export async function createSale(actor: Actor, input: SaleInput): Promise<SaleRe
   assertCan(actor.role, "sell");
   if (!input.lines.length) throw new SaleError("A sale needs at least one line");
 
-  return actor.scope.db.transaction(async (trx) => {
-    // The whole sale must run on one connection, so rebuild the scope against the
-    // transaction handle rather than the pool.
-    const me: Actor = { ...actor, scope: new TenantScope(trx, actor.scope.tenantId) };
-    const saleId = newId("sal");
+  const suppliedId = input.saleId?.trim() || null;
+  if (suppliedId) {
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(suppliedId)) {
+      throw new SaleError("That sale id is not usable");
+    }
+    // Already recorded? Hand back the original result rather than selling again.
+    const seen = await existingSale(actor, suppliedId);
+    if (seen) return seen;
+  }
+
+  try {
+    return await actor.scope.db.transaction(async (trx) => {
+      // The whole sale must run on one connection, so rebuild the scope against the
+      // transaction handle rather than the pool.
+      const me: Actor = { ...actor, scope: new TenantScope(trx, actor.scope.tenantId) };
+      const saleId = suppliedId ?? newId("sal");
     const createdAt = nowIso();
     const today = todayIso();
     const items: SaleItemResult[] = [];
@@ -254,8 +271,86 @@ export async function createSale(actor: Actor, input: SaleInput): Promise<SaleRe
       after: { totalPesewas: total, lines: items.length, controlledEntries },
     });
 
-    return { saleId, subtotalPesewas: subtotal, discountPesewas: discount, totalPesewas: total, changePesewas: change, items, controlledEntries };
-  });
+      return { saleId, subtotalPesewas: subtotal, discountPesewas: discount, totalPesewas: total, changePesewas: change, items, controlledEntries };
+    });
+  } catch (err) {
+    // Two requests with the same id can pass the check above together. The primary
+    // key on sales.sale_id is the real arbiter: whoever loses the race rolls back
+    // and returns the sale the winner wrote.
+    if (suppliedId && isDuplicateKey(err)) {
+      const seen = await existingSale(actor, suppliedId);
+      if (seen) return seen;
+      // sale_id is the primary key across the whole table, not per tenant, so this
+      // is another pharmacy's sale. With client-minted UUIDs it cannot happen; if it
+      // ever does, say so rather than crashing.
+      throw new SaleError("That sale id is already in use");
+    }
+    throw err;
+  }
+}
+
+/** True when the database refused a write because the row already exists. */
+function isDuplicateKey(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : "";
+  return /UNIQUE constraint failed|duplicate key value violates unique constraint/i.test(message);
+}
+
+/**
+ * Rebuild a sale that has already been recorded, in the same shape createSale
+ * returns, so a repeat caller cannot tell the difference.
+ */
+export async function existingSale(actor: Actor, saleId: string): Promise<SaleResult | null> {
+  const sale = await actor.scope.get<{
+    sale_id: string;
+    subtotal_pesewas: number;
+    discount_pesewas: number;
+    total_pesewas: number;
+    change_pesewas: number;
+  }>(
+    "SELECT sale_id, subtotal_pesewas, discount_pesewas, total_pesewas, change_pesewas FROM sales WHERE tenant_id = {{tenant}} AND sale_id = ?",
+    saleId,
+  );
+  if (!sale) return null;
+
+  const items = await actor.scope.all<{
+    product_id: string;
+    batch_id: string;
+    quantity: number;
+    unit_price_pesewas: number;
+    line_total_pesewas: number;
+    batch_number: string;
+    expiry_date: string | null;
+  }>(
+    `SELECT si.product_id, si.batch_id, si.quantity, si.unit_price_pesewas, si.line_total_pesewas,
+            b.batch_number, b.expiry_date
+       FROM sale_items si JOIN batches b ON b.batch_id = si.batch_id
+      WHERE si.tenant_id = {{tenant}} AND si.sale_id = ?
+      ORDER BY si.sale_item_id ASC`,
+    saleId,
+  );
+
+  const controlled = await actor.scope.get<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM controlled_register WHERE tenant_id = {{tenant}} AND reference_type = 'sale' AND reference_id = ?",
+    saleId,
+  );
+
+  return {
+    saleId: sale.sale_id,
+    subtotalPesewas: sale.subtotal_pesewas,
+    discountPesewas: sale.discount_pesewas,
+    totalPesewas: sale.total_pesewas,
+    changePesewas: sale.change_pesewas,
+    items: items.map((row) => ({
+      productId: row.product_id,
+      batchId: row.batch_id,
+      batchNumber: row.batch_number,
+      expiryDate: row.expiry_date,
+      quantity: row.quantity,
+      unitPricePesewas: row.unit_price_pesewas,
+      lineTotalPesewas: row.line_total_pesewas,
+    })),
+    controlledEntries: controlled?.n ?? 0,
+  };
 }
 
 export type ReceiptLine = {

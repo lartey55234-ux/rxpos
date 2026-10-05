@@ -397,6 +397,7 @@ async function completeSale() {
     const result = await api("/api/sales", {
       method: "POST",
       body: JSON.stringify({
+        saleId: newSaleId(),
         branchId,
         lines: cart.map((line) => ({ productId: line.productId, quantity: line.quantity })),
         paymentMethod: method,
@@ -719,6 +720,7 @@ function toPesewas(value) {
   const amount = Number(value);
   return Number.isFinite(amount) && amount > 0 ? Math.round(amount * 100) : 0;
 }
+var newSaleId = () => `sal_${crypto.randomUUID()}`;
 var fld = (label, control) => `<div class="fld"><label>${label}</label>${control}</div>`;
 var flagsFor = (p) => p.controlled_class !== "none" ? ` <span class="badge b-exp">Class ${p.controlled_class}</span>` : p.prescription_required ? ` <span class="badge b-rx">Rx</span>` : "";
 async function renderProducts() {

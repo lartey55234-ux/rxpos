@@ -526,6 +526,7 @@ async function completeSale(): Promise<void> {
     const result = await api<{ receipt: Receipt }>("/api/sales", {
       method: "POST",
       body: JSON.stringify({
+        saleId: newSaleId(),
         branchId,
         lines: cart.map((line) => ({ productId: line.productId, quantity: line.quantity })),
         paymentMethod: method,
@@ -929,6 +930,9 @@ function toPesewas(value: string): number {
   const amount = Number(value);
   return Number.isFinite(amount) && amount > 0 ? Math.round(amount * 100) : 0;
 }
+
+/** The id for a sale, minted here so a retry is recognisably the same sale. */
+const newSaleId = (): string => `sal_${crypto.randomUUID()}`;
 
 const fld = (label: string, control: string): string => `<div class="fld"><label>${label}</label>${control}</div>`;
 
