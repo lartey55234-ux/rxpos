@@ -19,14 +19,14 @@ pass "counter page served with its security headers"
 
 TOKEN=$(curl -fsS --max-time 15 -X POST "$BASE/api/signup" \
   -H 'content-type: application/json' \
-  -d "{\"pharmacyName\":\"Verify Pharmacy\",\"ownerName\":\"Verify Owner\",\"email\":\"$EMAIL\",\"password\":\"verifypassword\",\"planId\":\"starter\"}" \
+  -d "{\"pharmacyName\":\"Verify Pharmacy\",\"ownerName\":\"Verify Owner\",\"email\":\"$EMAIL\",\"password\":\"verifypassword\"}" \
   | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).token))')
 [ -n "$TOKEN" ]
 pass "a pharmacy can register"
 
 CODE=$(curl -s --max-time 15 -o /dev/null -w '%{http_code}' -X POST "$BASE/api/signup" \
   -H 'content-type: application/json' \
-  -d "{\"pharmacyName\":\"Verify Pharmacy\",\"ownerName\":\"Verify Owner\",\"email\":\"$EMAIL\",\"password\":\"verifypassword\",\"planId\":\"starter\"}")
+  -d "{\"pharmacyName\":\"Verify Pharmacy\",\"ownerName\":\"Verify Owner\",\"email\":\"$EMAIL\",\"password\":\"verifypassword\"}")
 [ "$CODE" = "409" ]
 pass "a duplicate registration is refused with 409"
 

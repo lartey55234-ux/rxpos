@@ -30,7 +30,7 @@ jobs:
           curl -fsS -o /dev/null -w 'index.html %{http_code}\n' http://127.0.0.1:4173/
           curl -fsS -X POST http://127.0.0.1:4173/api/signup \
             -H 'content-type: application/json' \
-            -d '{"pharmacyName":"CI Pharmacy","ownerName":"CI Owner","email":"ci@example.com","password":"secret123","planId":"starter"}' \
+            -d '{"pharmacyName":"CI Pharmacy","ownerName":"CI Owner","email":"ci@example.com","password":"secret123"}' \
             | grep -q '"token"'
           echo "signup ok"
 
