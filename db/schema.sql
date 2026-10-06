@@ -82,6 +82,27 @@ CREATE TABLE IF NOT EXISTS password_resets (
   used_at     TEXT
 );
 
+-- What went wrong, so a fault at a pharmacy arrives as a stack trace rather than
+-- a phone call. Grouped by fingerprint: one row per distinct fault, with a count,
+-- so the table stays small and the list stays readable.
+--
+-- Deliberately no request bodies. A sign-in body holds a password, and an error
+-- report is not worth leaking one for.
+CREATE TABLE IF NOT EXISTS error_reports (
+  report_id     TEXT PRIMARY KEY,
+  fingerprint   TEXT NOT NULL UNIQUE,
+  source        TEXT NOT NULL,
+  tenant_id     TEXT,
+  user_id       TEXT,
+  path          TEXT,
+  message       TEXT NOT NULL,
+  stack         TEXT,
+  context_json  TEXT,
+  count         INTEGER NOT NULL DEFAULT 1,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS categories (
   category_id  TEXT PRIMARY KEY,
   tenant_id    TEXT NOT NULL REFERENCES tenants(tenant_id),
@@ -300,3 +321,5 @@ CREATE INDEX IF NOT EXISTS idx_intents_tenant  ON payment_intents(tenant_id, sta
 CREATE INDEX IF NOT EXISTS idx_intents_ref     ON payment_intents(reference);
 
 CREATE INDEX IF NOT EXISTS idx_resets_token ON password_resets(token_hash);
+
+CREATE INDEX IF NOT EXISTS idx_errors_recent ON error_reports(last_seen_at);

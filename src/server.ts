@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { Database } from "./storage/index.ts";
 import { AuthError, addStaff, authenticate, login, registerPharmacy, seedPlans } from "./auth.ts";
 import { RateLimitError, RateLimiter } from "./ratelimit.ts";
-import { PermissionError, can, type Permission, type Role } from "./permissions.ts";
+import { PermissionError, assertCan, can, type Permission, type Role } from "./permissions.ts";
 import { PlanLimitError, planFor, usageFor } from "./plans.ts";
 import { SaleError, createSale, getReceipt } from "./sales.ts";
 import { createPrescription } from "./prescriptions.ts";
@@ -29,6 +29,7 @@ import { importCatalogue, type ImportField } from "./import.ts";
 import { confirmCharge, paymentState, startCharge } from "./checkout.ts";
 import { checkResetToken, requestPasswordReset, resetPassword } from "./password.ts";
 import { ConsoleMailer, MailError, type Mailer } from "./mail.ts";
+import { clearErrors, errorSummary, listErrors, recordError } from "./errors.ts";
 import { PaystackGateway, verifyWebhookSignature, type Channel, type PaymentGateway } from "./payments.ts";
 import { ValidationError } from "./util.ts";
 import type { Actor } from "./actor.ts";
@@ -90,6 +91,7 @@ const PERMISSIONS: Permission[] = [
   "assets",
   "plans",
   "reports",
+  "diagnostics",
 ];
 
 function send(res: ServerResponse, status: number, body: unknown): void {
@@ -177,6 +179,8 @@ export function createRequestHandler(
 
   // A reset endpoint is a way to send mail to strangers. Keep it tight.
   const forgotLimiter = new RateLimiter(5, 60 * 60 * 1000);
+  // A broken client can fail in a loop. Cap what one address can report.
+  const errorLimiter = new RateLimiter(60, 60 * 60 * 1000);
   const loginLimiter = new RateLimiter(options.loginLimit ?? 30, 15 * 60 * 1000);
   const signupLimiter = new RateLimiter(options.signupLimit ?? 5, 60 * 60 * 1000);
 
@@ -237,6 +241,62 @@ export function createRequestHandler(
           }
         }
         send(res, 200, { received: true });
+        return;
+      }
+
+      /* --------------------------- what broke --------------------------- */
+
+      // Unauthenticated on purpose: a fault can happen on the sign-in screen, which
+      // is exactly when you would want to hear about it. A valid token, if there is
+      // one, is attached for context.
+      if (method === "POST" && path === "/api/errors") {
+        errorLimiter.hit(clientKey(req));
+        const body = await readJson(req);
+
+        let tenantId: string | null = null;
+        let userId: string | null = null;
+        try {
+          const header = req.headers.authorization ?? "";
+          const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
+          if (bearer) {
+            const me = await authenticate(db, bearer);
+            tenantId = me.scope.tenantId;
+            userId = me.userId;
+          }
+        } catch {
+          /* an anonymous fault is still worth recording */
+        }
+
+        await recordError(db, {
+          source: "client",
+          message: str(body.message) || "Unknown error",
+          stack: body.stack ? str(body.stack) : null,
+          path: body.path ? str(body.path) : null,
+          tenantId,
+          userId,
+          context:
+            body.context && typeof body.context === "object"
+              ? (body.context as Record<string, unknown>)
+              : null,
+        });
+        send(res, 202, { received: true });
+        return;
+      }
+
+      if (method === "GET" && path === "/api/errors") {
+        const me = await actor();
+        assertCan(me.role, "diagnostics");
+        send(res, 200, {
+          errors: await listErrors(db, Number(url.searchParams.get("limit") ?? 100)),
+          summary: await errorSummary(db),
+        });
+        return;
+      }
+
+      if (method === "DELETE" && path === "/api/errors") {
+        const me = await actor();
+        assertCan(me.role, "diagnostics");
+        send(res, 200, { cleared: await clearErrors(db) });
         return;
       }
 
@@ -588,9 +648,20 @@ export function createRequestHandler(
 
       send(res, 404, { error: `No route for ${method} ${path}` });
     } catch (err) {
+      const status = statusFor(err);
       const message = err instanceof Error ? err.message : "Unexpected error";
-      if (statusFor(err) === 500) console.error(`[rxpos] ${method} ${path}:`, err);
-      send(res, statusFor(err), { error: message });
+      if (status === 500) {
+        console.error(`[rxpos] ${method} ${path}:`, err);
+        // A 500 is a fault in the software, not a refusal. Those are the ones worth
+        // hearing about without waiting for the pharmacy to phone.
+        await recordError(db, {
+          source: "server",
+          message,
+          stack: err instanceof Error ? (err.stack ?? null) : null,
+          path: `${method} ${path}`,
+        });
+      }
+      send(res, status, { error: message });
     }
   };
 }

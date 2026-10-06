@@ -238,6 +238,7 @@ function renderApp() {
     ...session.permissions.products ? [{ id: "products", label: "Products" }] : [],
     ...session.permissions.suppliers ? [{ id: "suppliers", label: "Suppliers" }] : [],
     ...session.permissions.users ? [{ id: "team", label: "Team" }] : [],
+    ...session.permissions.diagnostics ? [{ id: "faults", label: "What broke" }] : [],
     { id: "alerts", label: "Alerts" },
     ...session.permissions.reports ? [{ id: "register", label: "Register" }] : [],
     ...session.permissions.reports ? [{ id: "reports", label: "Reports" }] : []
@@ -251,6 +252,7 @@ function renderApp() {
       <nav class="tabs">${tabs.map((t) => `<button data-tab="${t.id}" class="${view === t.id ? "on" : ""}">${t.label}</button>`).join("")}</nav>
       <div class="ctx">
         <label>Branch <select id="branchSel">${session.branches.map((b) => `<option value="${b.branch_id}"${b.branch_id === branchId ? " selected" : ""}>${esc(b.name)}</option>`).join("")}</select></label>
+        <button class="btn sm danger" id="faults" style="display:none"></button>
         <button class="btn sm ghost" id="syncNow" style="display:none"></button>
         <button class="btn sm ghost" id="signOut">Sign out</button>
       </div>
@@ -261,6 +263,14 @@ function renderApp() {
   byId("signOut").addEventListener("click", signOut);
   byId("syncNow").addEventListener("click", () => void showQueue());
   void renderQueueBadge();
+  const faults = document.getElementById("faults");
+  if (faults) {
+    faults.addEventListener("click", () => {
+      view = "faults";
+      renderApp();
+    });
+    void renderFaultBadge();
+  }
   byId("branchSel").addEventListener("change", (event) => {
     branchId = event.target.value;
     cart = [];
@@ -282,6 +292,7 @@ function renderView() {
   else if (view === "products") void renderProducts();
   else if (view === "suppliers") void renderSuppliers();
   else if (view === "team") void renderTeam();
+  else if (view === "faults") void renderFaults();
   else if (view === "alerts") renderAlerts();
   else if (view === "register") renderRegister();
   else renderReports();
@@ -987,6 +998,48 @@ function noteFreshness(cachedAt) {
   bar.className = "netbar";
   bar.textContent = `Offline \u2014 stock as it was ${agoWords(cachedAt)}. Sales cannot be taken until the connection returns.`;
 }
+var reporting = false;
+function reportFault(message, stack, context) {
+  if (reporting || !message) return;
+  reporting = true;
+  try {
+    void fetch("/api/errors", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...token ? { authorization: `Bearer ${token}` } : {}
+      },
+      body: JSON.stringify({
+        message,
+        stack: stack ?? null,
+        path: window.location.pathname,
+        context: context ?? null
+      }),
+      keepalive: true
+    }).catch(() => {
+    }).finally(() => {
+      reporting = false;
+    });
+  } catch {
+    reporting = false;
+  }
+}
+function isExpected(err) {
+  return err instanceof NoConnection;
+}
+function watchForFaults() {
+  window.addEventListener("error", (event) => {
+    reportFault(event.message || "Uncaught error", event.error?.stack ?? null);
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason;
+    if (isExpected(reason)) return;
+    reportFault(
+      reason instanceof Error ? reason.message : String(reason ?? "Unhandled rejection"),
+      reason instanceof Error ? reason.stack ?? null : null
+    );
+  });
+}
 async function queueSale(sale) {
   await localPutKeyed(QUEUE_STORE, sale);
 }
@@ -1103,6 +1156,69 @@ function showQueuedSale(sale, waiting) {
     <div class="note">The batch numbers and the final receipt come from the server, so that follows once this is sent.</div>
     <div class="foot"><button class="btn primary" id="queuedOk">Done</button></div>`);
   byId("queuedOk").addEventListener("click", closeModal);
+}
+async function renderFaults() {
+  byId("main").innerHTML = `<section class="card">
+    <h2>What broke <span class="badge b-mute">owner only</span>
+      <button class="btn sm ghost" id="clearFaults">Clear</button></h2>
+    <div id="faultList"><div class="empty">Loading\u2026</div></div>
+    <div class="note">
+      Faults reported by the counter and by the server, grouped so a loop that fails a
+      thousand times is one line. Kept for 90 days. Request bodies are never recorded,
+      so no password is in here.
+    </div>
+  </section>`;
+  byId("clearFaults").addEventListener("click", async () => {
+    try {
+      await api("/api/errors", { method: "DELETE" });
+      toast("Cleared");
+      await renderFaults();
+      void renderFaultBadge();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not clear them", true);
+    }
+  });
+  const box = byId("faultList");
+  try {
+    const body = await api("/api/errors");
+    if (!body.errors.length) {
+      box.innerHTML = `<div class="empty">Nothing has broken. Long may it last.</div>`;
+      return;
+    }
+    box.innerHTML = `<div class="note" style="margin-top:0;margin-bottom:12px">
+        ${body.summary.faults} distinct fault${body.summary.faults === 1 ? "" : "s"} in the last day,
+        ${body.summary.occurrences} time${body.summary.occurrences === 1 ? "" : "s"} between them.
+      </div>
+      <table><thead><tr><th>What</th><th>Where</th><th class="num">Times</th><th>Last seen</th></tr></thead><tbody>
+      ${body.errors.map(
+      (fault) => `<tr>
+            <td><b>${esc(fault.message)}</b>
+              ${fault.stack ? `<details><summary style="font-size:11.5px;color:var(--muted);cursor:pointer">stack</summary><pre style="font-size:11px;white-space:pre-wrap;margin:6px 0 0">${esc(fault.stack)}</pre></details>` : ""}</td>
+            <td>${esc(fault.path ?? "\u2014")}<br><span class="badge ${fault.source === "server" ? "b-rx" : "b-mute"}">${esc(fault.source)}</span></td>
+            <td class="num">${fault.count}</td>
+            <td>${esc(new Date(fault.last_seen_at).toLocaleString())}</td>
+          </tr>`
+    ).join("")}
+      </tbody></table>`;
+  } catch (err) {
+    box.innerHTML = `<div class="empty">${esc(err instanceof Error ? err.message : "Could not load them")}</div>`;
+  }
+}
+async function renderFaultBadge() {
+  const button = document.getElementById("faults");
+  if (!button || !session?.permissions.diagnostics) return;
+  try {
+    const body = await api("/api/errors?limit=1");
+    if (!body.summary.faults) {
+      button.style.display = "none";
+      return;
+    }
+    button.style.display = "";
+    button.textContent = `${body.summary.faults} fault${body.summary.faults === 1 ? "" : "s"} today`;
+    button.className = "btn sm danger";
+  } catch {
+    button.style.display = "none";
+  }
 }
 var PRODUCT_FORMS = ["Tablets", "Capsules", "Syrup", "Suspension", "Injection", "Sachet", "Cream", "Ointment", "Drops", "Inhaler", "Device", "Other"];
 function toPesewas(value) {
@@ -1546,6 +1662,7 @@ async function boot() {
     navigator.serviceWorker.register("/sw.js").catch(() => {
     });
   }
+  watchForFaults();
   window.addEventListener("online", () => {
     noteFreshness(null);
     void syncQueue();

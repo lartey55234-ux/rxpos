@@ -9,7 +9,9 @@ export type Permission =
   | "users"
   | "assets"
   | "plans"
-  | "reports";
+  | "reports"
+  /** Seeing what broke. Owner only: a stack trace can name a patient. */
+  | "diagnostics";
 
 /**
  * Asset values are owner-only: administrators manage stock and sales but never
@@ -25,6 +27,7 @@ const MATRIX: Record<Permission, Role[]> = {
   assets: ["owner"],
   plans: ["owner"],
   reports: ["owner", "admin"],
+  diagnostics: ["owner"],
 };
 
 export class PermissionError extends Error {

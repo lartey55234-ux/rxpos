@@ -364,6 +364,7 @@ function renderApp(): void {
     ...(session.permissions.products ? [{ id: "products", label: "Products" }] : []),
     ...(session.permissions.suppliers ? [{ id: "suppliers", label: "Suppliers" }] : []),
     ...(session.permissions.users ? [{ id: "team", label: "Team" }] : []),
+    ...(session.permissions.diagnostics ? [{ id: "faults", label: "What broke" }] : []),
     { id: "alerts", label: "Alerts" },
     ...(session.permissions.reports ? [{ id: "register", label: "Register" }] : []),
     ...(session.permissions.reports ? [{ id: "reports", label: "Reports" }] : []),
@@ -381,6 +382,7 @@ function renderApp(): void {
         <label>Branch <select id="branchSel">${session.branches
           .map((b) => `<option value="${b.branch_id}"${b.branch_id === branchId ? " selected" : ""}>${esc(b.name)}</option>`)
           .join("")}</select></label>
+        <button class="btn sm danger" id="faults" style="display:none"></button>
         <button class="btn sm ghost" id="syncNow" style="display:none"></button>
         <button class="btn sm ghost" id="signOut">Sign out</button>
       </div>
@@ -392,6 +394,14 @@ function renderApp(): void {
   byId("signOut").addEventListener("click", signOut);
   byId("syncNow").addEventListener("click", () => void showQueue());
   void renderQueueBadge();
+  const faults = document.getElementById("faults");
+  if (faults) {
+    faults.addEventListener("click", () => {
+      view = "faults";
+      renderApp();
+    });
+    void renderFaultBadge();
+  }
   byId("branchSel").addEventListener("change", (event) => {
     branchId = (event.target as HTMLSelectElement).value;
     cart = [];
@@ -415,6 +425,7 @@ function renderView(): void {
   else if (view === "products") void renderProducts();
   else if (view === "suppliers") void renderSuppliers();
   else if (view === "team") void renderTeam();
+  else if (view === "faults") void renderFaults();
   else if (view === "alerts") renderAlerts();
   else if (view === "register") renderRegister();
   else renderReports();
@@ -1268,6 +1279,72 @@ function noteFreshness(cachedAt: number | null): void {
   bar.textContent = `Offline — stock as it was ${agoWords(cachedAt)}. Sales cannot be taken until the connection returns.`;
 }
 
+/* ---------------------------- what broke --------------------------------- */
+
+type StoredFault = {
+  report_id: string;
+  source: "server" | "client";
+  message: string;
+  stack: string | null;
+  path: string | null;
+  count: number;
+  first_seen_at: string;
+  last_seen_at: string;
+};
+
+let reporting = false;
+
+/**
+ * Tell the server something broke. Never throws, never recurses, and never sends
+ * the query string: a reset link carries a token, and an error report is not worth
+ * leaking one for.
+ */
+function reportFault(message: string, stack?: string | null, context?: Record<string, unknown>): void {
+  if (reporting || !message) return;
+  reporting = true;
+  try {
+    void fetch("/api/errors", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({
+        message,
+        stack: stack ?? null,
+        path: window.location.pathname,
+        context: context ?? null,
+      }),
+      keepalive: true,
+    })
+      .catch(() => {})
+      .finally(() => {
+        reporting = false;
+      });
+  } catch {
+    reporting = false;
+  }
+}
+
+/** Losing the connection is expected, not a fault. Reporting it would be noise. */
+function isExpected(err: unknown): boolean {
+  return err instanceof NoConnection;
+}
+
+function watchForFaults(): void {
+  window.addEventListener("error", (event) => {
+    reportFault((event as ErrorEvent).message || "Uncaught error", (event as ErrorEvent).error?.stack ?? null);
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = (event as PromiseRejectionEvent).reason;
+    if (isExpected(reason)) return;
+    reportFault(
+      reason instanceof Error ? reason.message : String(reason ?? "Unhandled rejection"),
+      reason instanceof Error ? (reason.stack ?? null) : null,
+    );
+  });
+}
+
 /* ------------------------------ the queue -------------------------------- */
 
 /**
@@ -1440,6 +1517,77 @@ function showQueuedSale(sale: QueuedSale, waiting: number): void {
 }
 
 /* ------------------------------- catalogue ------------------------------ */
+
+/** What broke, for the owner. A stack trace can name a patient, so nobody else. */
+async function renderFaults(): Promise<void> {
+  byId("main").innerHTML = `<section class="card">
+    <h2>What broke <span class="badge b-mute">owner only</span>
+      <button class="btn sm ghost" id="clearFaults">Clear</button></h2>
+    <div id="faultList"><div class="empty">Loading…</div></div>
+    <div class="note">
+      Faults reported by the counter and by the server, grouped so a loop that fails a
+      thousand times is one line. Kept for 90 days. Request bodies are never recorded,
+      so no password is in here.
+    </div>
+  </section>`;
+
+  byId("clearFaults").addEventListener("click", async () => {
+    try {
+      await api("/api/errors", { method: "DELETE" });
+      toast("Cleared");
+      await renderFaults();
+      void renderFaultBadge();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not clear them", true);
+    }
+  });
+
+  const box = byId("faultList");
+  try {
+    const body = await api<{ errors: StoredFault[]; summary: { faults: number; occurrences: number } }>("/api/errors");
+    if (!body.errors.length) {
+      box.innerHTML = `<div class="empty">Nothing has broken. Long may it last.</div>`;
+      return;
+    }
+    box.innerHTML = `<div class="note" style="margin-top:0;margin-bottom:12px">
+        ${body.summary.faults} distinct fault${body.summary.faults === 1 ? "" : "s"} in the last day,
+        ${body.summary.occurrences} time${body.summary.occurrences === 1 ? "" : "s"} between them.
+      </div>
+      <table><thead><tr><th>What</th><th>Where</th><th class="num">Times</th><th>Last seen</th></tr></thead><tbody>
+      ${body.errors
+        .map(
+          (fault) => `<tr>
+            <td><b>${esc(fault.message)}</b>
+              ${fault.stack ? `<details><summary style="font-size:11.5px;color:var(--muted);cursor:pointer">stack</summary><pre style="font-size:11px;white-space:pre-wrap;margin:6px 0 0">${esc(fault.stack)}</pre></details>` : ""}</td>
+            <td>${esc(fault.path ?? "—")}<br><span class="badge ${fault.source === "server" ? "b-rx" : "b-mute"}">${esc(fault.source)}</span></td>
+            <td class="num">${fault.count}</td>
+            <td>${esc(new Date(fault.last_seen_at).toLocaleString())}</td>
+          </tr>`,
+        )
+        .join("")}
+      </tbody></table>`;
+  } catch (err) {
+    box.innerHTML = `<div class="empty">${esc(err instanceof Error ? err.message : "Could not load them")}</div>`;
+  }
+}
+
+/** A quiet nudge in the top bar, so the owner finds out without going looking. */
+async function renderFaultBadge(): Promise<void> {
+  const button = document.getElementById("faults");
+  if (!button || !session?.permissions.diagnostics) return;
+  try {
+    const body = await api<{ summary: { faults: number } }>("/api/errors?limit=1");
+    if (!body.summary.faults) {
+      button.style.display = "none";
+      return;
+    }
+    button.style.display = "";
+    button.textContent = `${body.summary.faults} fault${body.summary.faults === 1 ? "" : "s"} today`;
+    button.className = "btn sm danger";
+  } catch {
+    button.style.display = "none";
+  }
+}
 
 const PRODUCT_FORMS = ["Tablets", "Capsules", "Syrup", "Suspension", "Injection", "Sachet", "Cream", "Ointment", "Drops", "Inhaler", "Device", "Other"];
 
@@ -1975,6 +2123,7 @@ async function boot(): Promise<void> {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
   }
+  watchForFaults();
   window.addEventListener("online", () => {
     noteFreshness(null);
     void syncQueue();
