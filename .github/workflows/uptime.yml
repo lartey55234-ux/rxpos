@@ -1,0 +1,44 @@
+name: Uptime
+
+# A pharmacy's till depends on this answering. Nobody should find out it is down
+# from the pharmacy.
+#
+# GitHub emails the repository owner when a scheduled run fails, which is the whole
+# notification mechanism. No account, no cost.
+#
+# Note: GitHub disables scheduled workflows after 60 days without a push. Any
+# commit re-enables it, so a quiet repository needs a nudge.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The counter must answer
+        run: |
+          set -uo pipefail
+          url="https://rxpos.onrender.com/healthz"
+
+          for attempt in 1 2 3; do
+            body=$(mktemp)
+            # The free tier sleeps, so a slow first answer is expected rather than a
+            # fault. Give it room before calling it down.
+            code=$(curl -sS --max-time 100 -o "$body" -w '%{http_code}' "$url" 2>/dev/null || echo 000)
+            elapsed=$(curl -sS --max-time 100 -o /dev/null -w '%{time_total}' "$url" 2>/dev/null || echo 0)
+
+            if [ "$code" = "200" ] && grep -q '"status":"ok"' "$body"; then
+              echo "healthy on attempt $attempt"
+              awk -v t="$elapsed" 'BEGIN { if (t > 5) print "::warning::answered in " t "s — the service was cold. See the always-on server work." }'
+              exit 0
+            fi
+
+            echo "attempt $attempt: HTTP $code"
+            sleep 30
+          done
+
+          echo "::error::rxpos is not answering at $url. Check https://dashboard.render.com"
+          exit 1

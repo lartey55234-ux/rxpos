@@ -192,6 +192,29 @@ against whatever `DATABASE_URL` points at, one file at a time. CI runs both.
 - `SIGTERM` closes the server and the database, with a 5 second backstop, so a
   redeploy does not leave a half-written database behind.
 
+## Backups and restoring
+
+Two jobs, one mechanism: a pharmacy will ask "can I get my data out?", and you need
+to know you can restore after a mistake. Both are the same operation.
+
+```bash
+npm run backup  -- --from "$DATABASE_URL" --out backups/rxpos.json
+npm run restore -- --in backups/rxpos.json --to "$DATABASE_URL" --replace
+```
+
+Deliberately not `pg_dump`: that ties a restore to a matching client version and
+only works for PostgreSQL. This reads through the same interface the app uses, so
+it works on both engines, and the restore **checks every table against the backup
+and exits non-zero if anything is missing** rather than reporting success blindly.
+
+`--replace` is required to write into a database that already holds rows, and the
+command says how many rows it is about to delete first.
+
+**This has been drilled against production**, not just written: the live database
+was exported, loaded into a fresh database, and the restored copy signed in,
+served its stock, and returned its Controlled Drugs Register and prescriptions
+intact. Do that again before you rely on it.
+
 ## Verifying a deploy
 
 `scripts/verify-deploy.sh <url>` boots nothing and assumes nothing: it checks the
