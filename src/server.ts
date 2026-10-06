@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Database } from "./storage/index.ts";
-import { AuthError, addStaff, authenticate, login, registerPharmacy, seedPlans } from "./auth.ts";
+import { AuthError, addStaff, authenticate, login, recoverOwnerWithCode, regenerateRecoveryCodes, registerPharmacy, resetStaffPassword, seedPlans } from "./auth.ts";
 import { RateLimitError, RateLimiter } from "./ratelimit.ts";
 import { PermissionError, assertCan, can, type Permission, type Role } from "./permissions.ts";
 import { PlanLimitError, planFor, usageFor } from "./plans.ts";
@@ -328,6 +328,14 @@ export function createRequestHandler(
         return;
       }
 
+      if (method === "POST" && path === "/api/password/recover") {
+        forgotLimiter.hit(clientKey(req));
+        const body = await readJson(req);
+        const result = await recoverOwnerWithCode(db, str(body.email), str(body.code), str(body.password));
+        send(res, 200, { email: result.email });
+        return;
+      }
+
       if (method === "POST" && path === "/api/login") {
         loginLimiter.hit(clientKey(req));
         const body = await readJson(req);
@@ -362,7 +370,11 @@ export function createRequestHandler(
           branchName: body.branchName ? String(body.branchName) : undefined,
           phone: body.phone ? String(body.phone) : null,
         });
-        send(res, 201, { token: result.token, ...(await sessionPayload(db, await authenticate(db, result.token), gateway)) });
+        send(res, 201, {
+          token: result.token,
+          recoveryCodes: result.recoveryCodes,
+          ...(await sessionPayload(db, await authenticate(db, result.token), gateway)),
+        });
         return;
       }
 
@@ -603,6 +615,23 @@ export function createRequestHandler(
           branchId: optional(body.branchId),
         });
         send(res, 201, { userId });
+        return;
+      }
+
+      const staffPasswordMatch = /^\/api\/staff\/([^/]+)\/password$/.exec(path);
+      if (method === "POST" && staffPasswordMatch) {
+        const me = await actor();
+        const body = await readJson(req);
+        await resetStaffPassword(db, me, staffPasswordMatch[1], str(body.password));
+        send(res, 200, { ok: true });
+        return;
+      }
+
+      if (method === "POST" && path === "/api/recovery-codes") {
+        const me = await actor();
+        const body = await readJson(req);
+        const recoveryCodes = await regenerateRecoveryCodes(db, me, str(body.currentPassword));
+        send(res, 200, { recoveryCodes });
         return;
       }
 

@@ -161,7 +161,7 @@ function debounce<T extends (...args: never[]) => void>(fn: T, ms: number): T {
 
 /* ------------------------------- login ------------------------------- */
 
-type AuthMode = "signin" | "signup" | "forgot";
+type AuthMode = "signin" | "signup" | "forgot" | "recovery";
 let authMode: AuthMode = "signin";
 
 const PLANS = [
@@ -177,6 +177,20 @@ function forgotCard(): string {
     <p>Enter the email you sign in with, and we will send a link to choose a new one.</p>
     <div class="fld"><label>Email</label><input id="email" type="email" autocomplete="username"></div>
     <button class="btn primary" id="submit" style="width:100%;margin-top:16px">Send the link</button>
+    <button class="btn ghost" id="useRecovery" style="width:100%;margin-top:8px">Use an owner recovery code</button>
+    <button class="btn ghost" id="swap" style="width:100%;margin-top:8px">Back to sign in</button>
+  </div></div>`;
+}
+
+function recoveryCard(): string {
+  return `<div class="login"><div class="card">
+    <h1>Use a recovery code</h1>
+    <p>Owners can use one saved code to choose a new password. The code is spent after this.</p>
+    <div class="fld"><label>Owner email</label><input id="email" type="email" autocomplete="username"></div>
+    <div class="fld" style="margin-top:10px"><label>Recovery code</label><input id="recoveryCode" type="text" autocomplete="one-time-code" placeholder="RX-XXXX-XXXX-XXXX-XXXX"></div>
+    <div class="fld" style="margin-top:10px"><label>New password</label><input id="password" type="password" autocomplete="new-password"></div>
+    <div class="fld" style="margin-top:10px"><label>Type it again</label><input id="againPassword" type="password" autocomplete="new-password"></div>
+    <button class="btn primary" id="submit" style="width:100%;margin-top:16px">Recover the owner account</button>
     <button class="btn ghost" id="swap" style="width:100%;margin-top:8px">Back to sign in</button>
   </div></div>`;
 }
@@ -255,7 +269,9 @@ function renderLogin(): void {
         </div></div>`
       : authMode === "forgot"
         ? forgotCard()
-        : `<div class="login wide"><div class="card">
+        : authMode === "recovery"
+          ? recoveryCard()
+          : `<div class="login wide"><div class="card">
           <h1>Create your pharmacy</h1>
           <p>You can add staff and stock as soon as you are in.</p>
           <div class="fld"><label>Pharmacy name</label><input id="pharmacyName" type="text" autocomplete="organization"></div>
@@ -272,6 +288,30 @@ function renderLogin(): void {
         </div></div>`;
 
   const submit = async (): Promise<void> => {
+    if (authMode === "recovery") {
+      const password = (byId("password") as HTMLInputElement).value;
+      if (password !== (byId("againPassword") as HTMLInputElement).value) {
+        toast("Those two passwords do not match", true);
+        return;
+      }
+      try {
+        await api("/api/password/recover", {
+          method: "POST",
+          body: JSON.stringify({
+            email: (byId("email") as HTMLInputElement).value,
+            code: (byId("recoveryCode") as HTMLInputElement).value,
+            password,
+          }),
+        });
+        authMode = "signin";
+        renderLogin();
+        toast("Password changed — that recovery code has been used");
+      } catch (err) {
+        toast(err instanceof Error ? err.message : "Could not recover the account", true);
+      }
+      return;
+    }
+
     if (authMode === "forgot") {
       const email = (byId("email") as HTMLInputElement).value;
       try {
@@ -311,7 +351,7 @@ function renderLogin(): void {
         };
 
     try {
-      const body = await api<{ token: string } & Session>(signingIn ? "/api/login" : "/api/signup", {
+      const body = await api<{ token: string; recoveryCodes?: string[] } & Session>(signingIn ? "/api/login" : "/api/signup", {
         method: "POST",
         body: JSON.stringify(payload),
       });
@@ -324,6 +364,7 @@ function renderLogin(): void {
       branchId = body.branches[0]?.branch_id ?? "";
       view = "counter";
       renderApp();
+      if (!signingIn && body.recoveryCodes?.length) showRecoveryCodes(body.recoveryCodes);
     } catch (err) {
       toast(err instanceof Error ? err.message : "That did not work", true);
     }
@@ -334,6 +375,13 @@ function renderLogin(): void {
     authMode = authMode === "signin" ? "signup" : "signin";
     renderLogin();
   });
+  const useRecovery = document.getElementById("useRecovery");
+  if (useRecovery) {
+    useRecovery.addEventListener("click", () => {
+      authMode = "recovery";
+      renderLogin();
+    });
+  }
   const forgot = document.getElementById("forgot");
   if (forgot) {
     forgot.addEventListener("click", () => {
@@ -1900,6 +1948,12 @@ async function renderTeam(): Promise<void> {
   </section>
 
   <section class="card" style="margin-top:16px">
+    <h2>Owner recovery codes</h2>
+    <p class="note">Keep these offline. Each code works once if the owner cannot use email. Generating a new set invalidates the old set.</p>
+    <div class="foot"><button class="btn" id="newRecoveryCodes">Generate a new set</button></div>
+  </section>
+
+  <section class="card" style="margin-top:16px">
     <h2>Branches</h2>
     <div class="inline">
       ${fld("Name", `<input id="brName" placeholder="Adabraka Branch">`)}
@@ -1935,6 +1989,25 @@ async function renderTeam(): Promise<void> {
     }
   });
 
+  byId("newRecoveryCodes").addEventListener("click", () => {
+    openModal(`<h2>Generate new recovery codes</h2>
+      <p class="note">This replaces every old code. Enter your current password to continue.</p>
+      ${fld("Current password", `<input id="recoveryPassword" type="password" autocomplete="current-password">`)}
+      <div class="foot"><button class="btn ghost" id="cancelRecovery">Cancel</button><button class="btn primary" id="confirmRecovery">Generate codes</button></div>`);
+    byId("cancelRecovery").addEventListener("click", closeModal);
+    byId("confirmRecovery").addEventListener("click", async () => {
+      try {
+        const result = await api<{ recoveryCodes: string[] }>("/api/recovery-codes", {
+          method: "POST",
+          body: JSON.stringify({ currentPassword: (byId("recoveryPassword") as HTMLInputElement).value }),
+        });
+        showRecoveryCodes(result.recoveryCodes);
+      } catch (err) {
+        toast(err instanceof Error ? err.message : "Could not generate recovery codes", true);
+      }
+    });
+  });
+
   byId("saveBranch").addEventListener("click", async () => {
     const name = (byId("brName") as HTMLInputElement).value.trim();
     if (!name) {
@@ -1966,16 +2039,66 @@ async function loadStaff(): Promise<void> {
     const data = await api<{ staff: { user_id: string; name: string; email: string; role: string; branch_id: string | null }[] }>("/api/staff");
     const branchOf = (id: string | null): string =>
       id ? (session?.branches.find((b) => b.branch_id === id)?.name ?? "—") : "All branches";
-    box.innerHTML = `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Branch</th></tr></thead><tbody>
+    box.innerHTML = `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Branch</th><th></th></tr></thead><tbody>
       ${data.staff
         .map(
-          (u) => `<tr><td><b>${esc(u.name)}</b></td><td>${esc(u.email)}</td><td>${esc(u.role)}</td><td>${esc(branchOf(u.branch_id))}</td></tr>`,
+          (u) => `<tr><td><b>${esc(u.name)}</b></td><td>${esc(u.email)}</td><td>${esc(u.role)}</td><td>${esc(branchOf(u.branch_id))}</td><td>${u.role === "owner" ? "" : `<button class="btn ghost resetStaff" data-user-id="${esc(u.user_id)}" data-name="${esc(u.name)}">Reset password</button>`}</td></tr>`,
         )
         .join("")}
     </tbody></table>`;
+    box.querySelectorAll<HTMLButtonElement>(".resetStaff").forEach((button) => {
+      button.addEventListener("click", () => resetStaffModal(button.dataset.userId ?? "", button.dataset.name ?? "Staff"));
+    });
   } catch (err) {
     box.innerHTML = `<div class="empty">${esc(err instanceof Error ? err.message : "Could not load the team")}</div>`;
   }
+}
+
+function showRecoveryCodes(codes: string[]): void {
+  const text = `rxpos owner recovery codes\n\n${codes.join("\n")}\n\nEach code works once. Keep this file offline.`;
+  openModal(`<h2>Save these recovery codes now</h2>
+    <p class="note">They will not be shown again. Each code works once, and only the hashed form is stored.</p>
+    <pre id="recoveryCodeList" style="padding:14px;background:var(--canvas);border-radius:8px;line-height:1.8;user-select:all">${codes.map(esc).join("\n")}</pre>
+    <div class="foot"><button class="btn" id="copyRecovery">Copy</button><button class="btn" id="downloadRecovery">Download .txt</button><button class="btn primary" id="savedRecovery">I saved them</button></div>`, true);
+  byId("copyRecovery").addEventListener("click", async () => {
+    await navigator.clipboard.writeText(codes.join("\n"));
+    toast("Recovery codes copied");
+  });
+  byId("downloadRecovery").addEventListener("click", () => {
+    const href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = "rxpos-owner-recovery-codes.txt";
+    link.click();
+    URL.revokeObjectURL(href);
+  });
+  byId("savedRecovery").addEventListener("click", closeModal);
+}
+
+function resetStaffModal(userId: string, name: string): void {
+  openModal(`<h2>Reset ${esc(name)}'s password</h2>
+    <p class="note">Their existing sessions will be signed out immediately.</p>
+    ${fld("New temporary password", `<input id="staffNewPassword" type="password" autocomplete="new-password">`)}
+    ${fld("Type it again", `<input id="staffAgainPassword" type="password" autocomplete="new-password">`)}
+    <div class="foot"><button class="btn ghost" id="cancelStaffReset">Cancel</button><button class="btn primary" id="confirmStaffReset">Reset password</button></div>`);
+  byId("cancelStaffReset").addEventListener("click", closeModal);
+  byId("confirmStaffReset").addEventListener("click", async () => {
+    const password = (byId("staffNewPassword") as HTMLInputElement).value;
+    if (password !== (byId("staffAgainPassword") as HTMLInputElement).value) {
+      toast("Those two passwords do not match", true);
+      return;
+    }
+    try {
+      await api(`/api/staff/${encodeURIComponent(userId)}/password`, {
+        method: "POST",
+        body: JSON.stringify({ password }),
+      });
+      closeModal();
+      toast(`${name}'s password was reset and old sessions were signed out`);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not reset the password", true);
+    }
+  });
 }
 
 function renderBranchList(): void {

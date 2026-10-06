@@ -82,6 +82,17 @@ CREATE TABLE IF NOT EXISTS password_resets (
   used_at     TEXT
 );
 
+-- One-time owner recovery codes. Only hashes are stored; the printable codes are
+-- returned once when generated. They work without email and each can be spent once.
+CREATE TABLE IF NOT EXISTS owner_recovery_codes (
+  recovery_code_id TEXT PRIMARY KEY,
+  tenant_id        TEXT NOT NULL REFERENCES tenants(tenant_id),
+  user_id          TEXT NOT NULL REFERENCES users(user_id),
+  code_hash        TEXT NOT NULL UNIQUE,
+  created_at       TEXT NOT NULL,
+  used_at          TEXT
+);
+
 -- What went wrong, so a fault at a pharmacy arrives as a stack trace rather than
 -- a phone call. Grouped by fingerprint: one row per distinct fault, with a count,
 -- so the table stays small and the list stays readable.
@@ -321,5 +332,6 @@ CREATE INDEX IF NOT EXISTS idx_intents_tenant  ON payment_intents(tenant_id, sta
 CREATE INDEX IF NOT EXISTS idx_intents_ref     ON payment_intents(reference);
 
 CREATE INDEX IF NOT EXISTS idx_resets_token ON password_resets(token_hash);
+CREATE INDEX IF NOT EXISTS idx_recovery_owner ON owner_recovery_codes(tenant_id, user_id, used_at);
 
 CREATE INDEX IF NOT EXISTS idx_errors_recent ON error_reports(last_seen_at);
