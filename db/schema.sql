@@ -37,6 +37,37 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   status           TEXT NOT NULL DEFAULT 'active'
 );
 
+
+-- Provider plan codes are created lazily, once per rxpos plan. Keeping them in a
+-- separate table lets an existing production database adopt billing without an
+-- ALTER TABLE migration.
+CREATE TABLE IF NOT EXISTS billing_plan_links (
+  plan_id             TEXT PRIMARY KEY REFERENCES plans(plan_id),
+  provider            TEXT NOT NULL,
+  provider_plan_code  TEXT NOT NULL UNIQUE,
+  created_at          TEXT NOT NULL
+);
+
+-- The provider-specific state for the tenant's current recurring subscription.
+-- email_token is never returned to the browser; Paystack requires it to cancel.
+CREATE TABLE IF NOT EXISTS subscription_billing (
+  billing_id                   TEXT PRIMARY KEY,
+  tenant_id                    TEXT NOT NULL UNIQUE REFERENCES tenants(tenant_id),
+  subscription_id              TEXT REFERENCES subscriptions(subscription_id),
+  plan_id                      TEXT NOT NULL REFERENCES plans(plan_id),
+  provider                     TEXT NOT NULL,
+  provider_plan_code           TEXT NOT NULL,
+  provider_subscription_code   TEXT UNIQUE,
+  provider_email_token         TEXT,
+  provider_customer_code       TEXT,
+  status                       TEXT NOT NULL,
+  current_period_start         TEXT,
+  current_period_end           TEXT,
+  next_payment_at              TEXT,
+  last_reference              TEXT,
+  updated_at                   TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS branches (
   branch_id   TEXT PRIMARY KEY,
   tenant_id   TEXT NOT NULL REFERENCES tenants(tenant_id),
@@ -60,6 +91,22 @@ CREATE TABLE IF NOT EXISTS users (
   created_at     TEXT NOT NULL
 );
 
+-- A checkout is written before the owner leaves for Paystack. Confirmation is
+-- idempotent, whether it arrives from the browser or a signed webhook.
+CREATE TABLE IF NOT EXISTS billing_checkouts (
+  checkout_id         TEXT PRIMARY KEY,
+  tenant_id           TEXT NOT NULL REFERENCES tenants(tenant_id),
+  user_id             TEXT NOT NULL REFERENCES users(user_id),
+  plan_id             TEXT NOT NULL REFERENCES plans(plan_id),
+  reference           TEXT NOT NULL UNIQUE,
+  provider            TEXT NOT NULL,
+  provider_plan_code  TEXT NOT NULL,
+  amount_pesewas      INTEGER NOT NULL,
+  status              TEXT NOT NULL DEFAULT 'pending',
+  created_at          TEXT NOT NULL,
+  confirmed_at        TEXT
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
   session_id   TEXT PRIMARY KEY,
   tenant_id    TEXT NOT NULL REFERENCES tenants(tenant_id),
@@ -80,6 +127,17 @@ CREATE TABLE IF NOT EXISTS password_resets (
   created_at  TEXT NOT NULL,
   expires_at  TEXT NOT NULL,
   used_at     TEXT
+);
+
+-- One-time owner recovery codes. Only hashes are stored; the printable codes are
+-- returned once when generated. They work without email and each can be spent once.
+CREATE TABLE IF NOT EXISTS owner_recovery_codes (
+  recovery_code_id TEXT PRIMARY KEY,
+  tenant_id        TEXT NOT NULL REFERENCES tenants(tenant_id),
+  user_id          TEXT NOT NULL REFERENCES users(user_id),
+  code_hash        TEXT NOT NULL UNIQUE,
+  created_at       TEXT NOT NULL,
+  used_at          TEXT
 );
 
 -- What went wrong, so a fault at a pharmacy arrives as a stack trace rather than
@@ -317,9 +375,13 @@ CREATE INDEX IF NOT EXISTS idx_sales_tenant_date      ON sales(tenant_id, sale_d
 CREATE INDEX IF NOT EXISTS idx_users_tenant           ON users(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_register_tenant        ON controlled_register(tenant_id, entry_date);
 
+CREATE INDEX IF NOT EXISTS idx_billing_checkout_tenant ON billing_checkouts(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_billing_plan_code ON billing_plan_links(provider_plan_code);
+
 CREATE INDEX IF NOT EXISTS idx_intents_tenant  ON payment_intents(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_intents_ref     ON payment_intents(reference);
 
 CREATE INDEX IF NOT EXISTS idx_resets_token ON password_resets(token_hash);
+CREATE INDEX IF NOT EXISTS idx_recovery_owner ON owner_recovery_codes(tenant_id, user_id, used_at);
 
 CREATE INDEX IF NOT EXISTS idx_errors_recent ON error_reports(last_seen_at);

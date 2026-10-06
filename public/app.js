@@ -70,18 +70,25 @@ function debounce(fn, ms) {
   });
 }
 var authMode = "signin";
-var PLANS = [
-  { id: "free", label: "Free \u2014 20 products, 1 shop" },
-  { id: "starter", label: "Starter \u2014 GHS 60/month" },
-  { id: "standard", label: "Standard \u2014 GHS 100/month" },
-  { id: "pro", label: "Pro \u2014 GHS 150/month" }
-];
 function forgotCard() {
   return `<div class="login"><div class="card">
     <h1>Forgot your password?</h1>
     <p>Enter the email you sign in with, and we will send a link to choose a new one.</p>
     <div class="fld"><label>Email</label><input id="email" type="email" autocomplete="username"></div>
     <button class="btn primary" id="submit" style="width:100%;margin-top:16px">Send the link</button>
+    <button class="btn ghost" id="useRecovery" style="width:100%;margin-top:8px">Use an owner recovery code</button>
+    <button class="btn ghost" id="swap" style="width:100%;margin-top:8px">Back to sign in</button>
+  </div></div>`;
+}
+function recoveryCard() {
+  return `<div class="login"><div class="card">
+    <h1>Use a recovery code</h1>
+    <p>Owners can use one saved code to choose a new password. The code is spent after this.</p>
+    <div class="fld"><label>Owner email</label><input id="email" type="email" autocomplete="username"></div>
+    <div class="fld" style="margin-top:10px"><label>Recovery code</label><input id="recoveryCode" type="text" autocomplete="one-time-code" placeholder="RX-XXXX-XXXX-XXXX-XXXX"></div>
+    <div class="fld" style="margin-top:10px"><label>New password</label><input id="password" type="password" autocomplete="new-password"></div>
+    <div class="fld" style="margin-top:10px"><label>Type it again</label><input id="againPassword" type="password" autocomplete="new-password"></div>
+    <button class="btn primary" id="submit" style="width:100%;margin-top:16px">Recover the owner account</button>
     <button class="btn ghost" id="swap" style="width:100%;margin-top:8px">Back to sign in</button>
   </div></div>`;
 }
@@ -144,21 +151,41 @@ function renderLogin() {
           <button class="btn primary" id="submit" style="width:100%;margin-top:16px">Sign in</button>
           <button class="btn ghost" id="swap" style="width:100%;margin-top:8px">New pharmacy? Create an account</button>
           <button class="btn ghost" id="forgot" style="width:100%;margin-top:8px">Forgot your password?</button>
-        </div></div>` : authMode === "forgot" ? forgotCard() : `<div class="login wide"><div class="card">
+        </div></div>` : authMode === "forgot" ? forgotCard() : authMode === "recovery" ? recoveryCard() : `<div class="login wide"><div class="card">
           <h1>Create your pharmacy</h1>
-          <p>You can add staff and stock as soon as you are in.</p>
+          <p>Start free. Upgrade from Billing after the pharmacy is ready.</p>
           <div class="fld"><label>Pharmacy name</label><input id="pharmacyName" type="text" autocomplete="organization"></div>
           <div class="fld" style="margin-top:10px"><label>Your name</label><input id="ownerName" type="text" autocomplete="name"></div>
           <div class="fld" style="margin-top:10px"><label>Email</label><input id="email" type="email" autocomplete="username"></div>
           <div class="fld" style="margin-top:10px"><label>Password</label><input id="password" type="password" autocomplete="new-password"></div>
           <div class="fld" style="margin-top:10px"><label>Branch name</label><input id="branchName" type="text" placeholder="Main Pharmacy"></div>
-          <div class="fld" style="margin-top:10px"><label>Plan</label><select id="planId">${PLANS.map(
-    (plan) => `<option value="${plan.id}"${plan.id === "starter" ? " selected" : ""}>${esc(plan.label)}</option>`
-  ).join("")}</select></div>
           <button class="btn primary" id="submit" style="width:100%;margin-top:16px">Create pharmacy</button>
           <button class="btn ghost" id="swap" style="width:100%;margin-top:8px">Already have an account? Sign in</button>
         </div></div>`;
   const submit = async () => {
+    if (authMode === "recovery") {
+      const password2 = byId("password").value;
+      if (password2 !== byId("againPassword").value) {
+        toast("Those two passwords do not match", true);
+        return;
+      }
+      try {
+        await api("/api/password/recover", {
+          method: "POST",
+          body: JSON.stringify({
+            email: byId("email").value,
+            code: byId("recoveryCode").value,
+            password: password2
+          })
+        });
+        authMode = "signin";
+        renderLogin();
+        toast("Password changed \u2014 that recovery code has been used");
+      } catch (err) {
+        toast(err instanceof Error ? err.message : "Could not recover the account", true);
+      }
+      return;
+    }
     if (authMode === "forgot") {
       const email2 = byId("email").value;
       try {
@@ -188,8 +215,7 @@ function renderLogin() {
       password,
       pharmacyName: byId("pharmacyName").value,
       ownerName: byId("ownerName").value,
-      branchName: byId("branchName").value,
-      planId: byId("planId").value
+      branchName: byId("branchName").value
     };
     try {
       const body = await api(signingIn ? "/api/login" : "/api/signup", {
@@ -204,6 +230,7 @@ function renderLogin() {
       branchId = body.branches[0]?.branch_id ?? "";
       view = "counter";
       renderApp();
+      if (!signingIn && body.recoveryCodes?.length) showRecoveryCodes(body.recoveryCodes);
     } catch (err) {
       toast(err instanceof Error ? err.message : "That did not work", true);
     }
@@ -213,6 +240,13 @@ function renderLogin() {
     authMode = authMode === "signin" ? "signup" : "signin";
     renderLogin();
   });
+  const useRecovery = document.getElementById("useRecovery");
+  if (useRecovery) {
+    useRecovery.addEventListener("click", () => {
+      authMode = "recovery";
+      renderLogin();
+    });
+  }
   const forgot = document.getElementById("forgot");
   if (forgot) {
     forgot.addEventListener("click", () => {
@@ -238,6 +272,7 @@ function renderApp() {
     ...session.permissions.products ? [{ id: "products", label: "Products" }] : [],
     ...session.permissions.suppliers ? [{ id: "suppliers", label: "Suppliers" }] : [],
     ...session.permissions.users ? [{ id: "team", label: "Team" }] : [],
+    ...session.permissions.plans ? [{ id: "billing", label: "Billing" }] : [],
     ...session.permissions.diagnostics ? [{ id: "faults", label: "What broke" }] : [],
     { id: "alerts", label: "Alerts" },
     ...session.permissions.reports ? [{ id: "register", label: "Register" }] : [],
@@ -292,6 +327,7 @@ function renderView() {
   else if (view === "products") void renderProducts();
   else if (view === "suppliers") void renderSuppliers();
   else if (view === "team") void renderTeam();
+  else if (view === "billing") void renderBilling();
   else if (view === "faults") void renderFaults();
   else if (view === "alerts") renderAlerts();
   else if (view === "register") renderRegister();
@@ -1467,6 +1503,103 @@ async function loadSuppliers() {
     box.innerHTML = `<div class="empty">${esc(err instanceof Error ? err.message : "Could not load suppliers")}</div>`;
   }
 }
+async function renderBilling() {
+  byId("main").innerHTML = `<section class="card"><div class="empty">Loading billing\u2026</div></section>`;
+  try {
+    const state = await api("/api/billing");
+    const status = state.status.replaceAll("_", " ");
+    byId("main").innerHTML = `<section class="card">
+      <h2>Subscription billing</h2>
+      <p class="note">Current plan: <b>${esc(state.currentPlanId)}</b> \xB7 Status: <b>${esc(status)}</b>${state.nextPaymentAt ? ` \xB7 Next payment ${esc(state.nextPaymentAt.slice(0, 10))}` : ""}</p>
+      ${state.enabled ? `<p class="note">Paystack charges subscriptions monthly by card. Card details stay on Paystack, not rxpos.</p>` : `<div class="empty">Billing is not switched on for this deployment yet.</div>`}
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(210px,1fr));margin-top:16px">
+        ${state.plans.map((plan) => {
+      const current = plan.id === state.currentPlanId;
+      const limits = `${plan.maxProducts === null ? "Unlimited" : plan.maxProducts} products \xB7 ${plan.maxShops} shop${plan.maxShops === 1 ? "" : "s"} \xB7 ${plan.maxStaff} staff`;
+      return `<div class="card" style="box-shadow:none;border:1px solid var(--line)">
+            <h2>${esc(plan.name)}</h2>
+            <div style="font-size:22px;font-weight:800;margin:8px 0">${plan.pricePesewas ? `${money(plan.pricePesewas)}<span style="font-size:12px;color:var(--muted)"> / month</span>` : "Free"}</div>
+            <p class="note">${esc(limits)} \xB7 ${plan.maxSuppliers} suppliers</p>
+            ${current ? `<button class="btn" disabled>Current plan</button>` : plan.pricePesewas > 0 && state.enabled ? `<button class="btn primary choosePlan" data-plan="${esc(plan.id)}" data-name="${esc(plan.name)}">Choose ${esc(plan.name)}</button>` : ""}
+          </div>`;
+    }).join("")}
+      </div>
+      ${state.canManage ? `<div class="foot"><button class="btn" id="manageBilling">Update payment card</button><button class="btn danger" id="cancelBilling">Cancel renewal</button></div>` : ""}
+    </section>`;
+    byId("main").querySelectorAll(".choosePlan").forEach((button) => {
+      button.addEventListener("click", () => void beginSubscription(button.dataset.plan ?? "", button.dataset.name ?? "plan"));
+    });
+    const manage = document.getElementById("manageBilling");
+    if (manage) manage.addEventListener("click", async () => {
+      try {
+        const result = await api("/api/billing/manage");
+        window.open(result.url, "_blank", "noopener,noreferrer");
+      } catch (err) {
+        toast(err instanceof Error ? err.message : "Could not open subscription management", true);
+      }
+    });
+    const cancel = document.getElementById("cancelBilling");
+    if (cancel) cancel.addEventListener("click", () => cancelBillingModal(state.currentPeriodEnd));
+  } catch (err) {
+    byId("main").innerHTML = `<section class="card"><div class="empty">${esc(err instanceof Error ? err.message : "Could not load billing")}</div></section>`;
+  }
+}
+async function beginSubscription(planId, planName) {
+  try {
+    const result = await api(
+      "/api/billing/checkout",
+      { method: "POST", body: JSON.stringify({ planId }) }
+    );
+    const { checkout } = result;
+    openModal(`<h2>Subscribe to ${esc(planName)}</h2>
+      <p class="note">Paystack will take the first monthly card payment. rxpos changes the plan only after Paystack confirms it.</p>
+      <div id="billingWait" class="empty">Waiting for payment\u2026</div>
+      <div class="foot"><button class="btn" id="checkBilling">Check payment</button><button class="btn primary" id="openBilling">Open Paystack</button></div>
+      <div class="note">Reference <code>${esc(checkout.reference)}</code></div>`);
+    const check = async () => {
+      try {
+        const confirmation = await api("/api/billing/confirm", {
+          method: "POST",
+          body: JSON.stringify({ reference: checkout.reference })
+        });
+        if (confirmation.billing.status === "success" || confirmation.billing.status === "confirmed") {
+          closeModal();
+          session = await api("/api/session");
+          renderApp();
+          toast(`${planName} is active`);
+          return true;
+        }
+        byId("billingWait").textContent = `Not paid yet \u2014 Paystack says \u201C${confirmation.billing.status}\u201D.`;
+      } catch (err) {
+        byId("billingWait").textContent = err instanceof Error ? err.message : "Could not check payment";
+      }
+      return false;
+    };
+    byId("openBilling").addEventListener("click", () => window.open(checkout.authorizationUrl, "_blank", "noopener,noreferrer"));
+    byId("checkBilling").addEventListener("click", () => void check());
+    const poll = window.setInterval(async () => {
+      if (byId("modal").classList.contains("hidden") || await check()) window.clearInterval(poll);
+    }, 4e3);
+  } catch (err) {
+    toast(err instanceof Error ? err.message : "Could not start the subscription", true);
+  }
+}
+function cancelBillingModal(periodEnd) {
+  openModal(`<h2>Cancel renewal?</h2>
+    <p class="note">Paystack will stop future charges. The paid plan remains available${periodEnd ? ` until ${esc(periodEnd.slice(0, 10))}` : " through the paid period"}.</p>
+    <div class="foot"><button class="btn ghost" id="keepBilling">Keep subscription</button><button class="btn danger" id="confirmCancelBilling">Cancel renewal</button></div>`);
+  byId("keepBilling").addEventListener("click", closeModal);
+  byId("confirmCancelBilling").addEventListener("click", async () => {
+    try {
+      await api("/api/billing/cancel", { method: "POST", body: "{}" });
+      closeModal();
+      await renderBilling();
+      toast("Renewal cancelled; paid access continues through the current period");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not cancel the subscription", true);
+    }
+  });
+}
 async function renderTeam() {
   byId("main").innerHTML = `<section class="card">
     <h2>Add someone to the team</h2>
@@ -1483,6 +1616,12 @@ async function renderTeam() {
   <section class="card" style="margin-top:16px">
     <h2>Team</h2>
     <div id="staffList"><div class="empty">Loading\u2026</div></div>
+  </section>
+
+  <section class="card" style="margin-top:16px">
+    <h2>Owner recovery codes</h2>
+    <p class="note">Keep these offline. Each code works once if the owner cannot use email. Generating a new set invalidates the old set.</p>
+    <div class="foot"><button class="btn" id="newRecoveryCodes">Generate a new set</button></div>
   </section>
 
   <section class="card" style="margin-top:16px">
@@ -1519,6 +1658,24 @@ async function renderTeam() {
       toast(err instanceof Error ? err.message : "Could not add the account", true);
     }
   });
+  byId("newRecoveryCodes").addEventListener("click", () => {
+    openModal(`<h2>Generate new recovery codes</h2>
+      <p class="note">This replaces every old code. Enter your current password to continue.</p>
+      ${fld("Current password", `<input id="recoveryPassword" type="password" autocomplete="current-password">`)}
+      <div class="foot"><button class="btn ghost" id="cancelRecovery">Cancel</button><button class="btn primary" id="confirmRecovery">Generate codes</button></div>`);
+    byId("cancelRecovery").addEventListener("click", closeModal);
+    byId("confirmRecovery").addEventListener("click", async () => {
+      try {
+        const result = await api("/api/recovery-codes", {
+          method: "POST",
+          body: JSON.stringify({ currentPassword: byId("recoveryPassword").value })
+        });
+        showRecoveryCodes(result.recoveryCodes);
+      } catch (err) {
+        toast(err instanceof Error ? err.message : "Could not generate recovery codes", true);
+      }
+    });
+  });
   byId("saveBranch").addEventListener("click", async () => {
     const name = byId("brName").value.trim();
     if (!name) {
@@ -1546,14 +1703,66 @@ async function loadStaff() {
   try {
     const data = await api("/api/staff");
     const branchOf = (id) => id ? session?.branches.find((b) => b.branch_id === id)?.name ?? "\u2014" : "All branches";
-    box.innerHTML = `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Branch</th></tr></thead><tbody>
+    box.innerHTML = `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Branch</th><th></th></tr></thead><tbody>
       ${data.staff.map(
-      (u) => `<tr><td><b>${esc(u.name)}</b></td><td>${esc(u.email)}</td><td>${esc(u.role)}</td><td>${esc(branchOf(u.branch_id))}</td></tr>`
+      (u) => `<tr><td><b>${esc(u.name)}</b></td><td>${esc(u.email)}</td><td>${esc(u.role)}</td><td>${esc(branchOf(u.branch_id))}</td><td>${u.role === "owner" ? "" : `<button class="btn ghost resetStaff" data-user-id="${esc(u.user_id)}" data-name="${esc(u.name)}">Reset password</button>`}</td></tr>`
     ).join("")}
     </tbody></table>`;
+    box.querySelectorAll(".resetStaff").forEach((button) => {
+      button.addEventListener("click", () => resetStaffModal(button.dataset.userId ?? "", button.dataset.name ?? "Staff"));
+    });
   } catch (err) {
     box.innerHTML = `<div class="empty">${esc(err instanceof Error ? err.message : "Could not load the team")}</div>`;
   }
+}
+function showRecoveryCodes(codes) {
+  const text = `rxpos owner recovery codes
+
+${codes.join("\n")}
+
+Each code works once. Keep this file offline.`;
+  openModal(`<h2>Save these recovery codes now</h2>
+    <p class="note">They will not be shown again. Each code works once, and only the hashed form is stored.</p>
+    <pre id="recoveryCodeList" style="padding:14px;background:var(--canvas);border-radius:8px;line-height:1.8;user-select:all">${codes.map(esc).join("\n")}</pre>
+    <div class="foot"><button class="btn" id="copyRecovery">Copy</button><button class="btn" id="downloadRecovery">Download .txt</button><button class="btn primary" id="savedRecovery">I saved them</button></div>`, true);
+  byId("copyRecovery").addEventListener("click", async () => {
+    await navigator.clipboard.writeText(codes.join("\n"));
+    toast("Recovery codes copied");
+  });
+  byId("downloadRecovery").addEventListener("click", () => {
+    const href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = "rxpos-owner-recovery-codes.txt";
+    link.click();
+    URL.revokeObjectURL(href);
+  });
+  byId("savedRecovery").addEventListener("click", closeModal);
+}
+function resetStaffModal(userId, name) {
+  openModal(`<h2>Reset ${esc(name)}'s password</h2>
+    <p class="note">Their existing sessions will be signed out immediately.</p>
+    ${fld("New temporary password", `<input id="staffNewPassword" type="password" autocomplete="new-password">`)}
+    ${fld("Type it again", `<input id="staffAgainPassword" type="password" autocomplete="new-password">`)}
+    <div class="foot"><button class="btn ghost" id="cancelStaffReset">Cancel</button><button class="btn primary" id="confirmStaffReset">Reset password</button></div>`);
+  byId("cancelStaffReset").addEventListener("click", closeModal);
+  byId("confirmStaffReset").addEventListener("click", async () => {
+    const password = byId("staffNewPassword").value;
+    if (password !== byId("staffAgainPassword").value) {
+      toast("Those two passwords do not match", true);
+      return;
+    }
+    try {
+      await api(`/api/staff/${encodeURIComponent(userId)}/password`, {
+        method: "POST",
+        body: JSON.stringify({ password })
+      });
+      closeModal();
+      toast(`${name}'s password was reset and old sessions were signed out`);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not reset the password", true);
+    }
+  });
 }
 function renderBranchList() {
   const box = document.getElementById("branchList");

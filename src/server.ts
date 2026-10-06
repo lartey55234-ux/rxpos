@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Database } from "./storage/index.ts";
-import { AuthError, addStaff, authenticate, login, registerPharmacy, seedPlans } from "./auth.ts";
+import { AuthError, addStaff, authenticate, login, recoverOwnerWithCode, regenerateRecoveryCodes, registerPharmacy, resetStaffPassword, seedPlans } from "./auth.ts";
 import { RateLimitError, RateLimiter } from "./ratelimit.ts";
 import { PermissionError, assertCan, can, type Permission, type Role } from "./permissions.ts";
 import { PlanLimitError, planFor, usageFor } from "./plans.ts";
@@ -33,6 +33,7 @@ import { clearErrors, errorSummary, listErrors, recordError } from "./errors.ts"
 import { PaystackGateway, verifyWebhookSignature, type Channel, type PaymentGateway } from "./payments.ts";
 import { ValidationError } from "./util.ts";
 import type { Actor } from "./actor.ts";
+import { billingState, cancelSubscription, confirmSubscriptionCheckout, enforceBillingExpiry, handleSubscriptionWebhook, startSubscriptionCheckout, subscriptionManageLink } from "./billing.ts";
 
 const here = fileURLToPath(new URL("..", import.meta.url));
 const MIME: Record<string, string> = {
@@ -232,12 +233,17 @@ export function createRequestHandler(
         } catch {
           throw new ValidationError("Webhook body is not valid JSON");
         }
-        if (event.event === "charge.success" && event.data?.reference && gateway) {
+        if (gateway) {
           try {
-            await confirmCharge(db, gateway, event.data.reference);
+            const reference = String(event.data?.reference ?? "");
+            if (event.event === "charge.success" && reference) {
+              const saleIntent = await db.get("SELECT 1 AS x FROM payment_intents WHERE reference = ?", [reference]);
+              if (saleIntent) await confirmCharge(db, gateway, reference);
+            }
+            await handleSubscriptionWebhook(db, gateway, event as { event?: string; data?: Record<string, unknown> });
           } catch (err) {
             // Answer 200 anyway: Paystack retries, and a mismatch needs a human.
-            console.error("[rxpos] webhook charge.success:", err);
+            console.error(`[rxpos] webhook ${event.event ?? "unknown"}:`, err);
           }
         }
         send(res, 200, { received: true });
@@ -328,6 +334,14 @@ export function createRequestHandler(
         return;
       }
 
+      if (method === "POST" && path === "/api/password/recover") {
+        forgotLimiter.hit(clientKey(req));
+        const body = await readJson(req);
+        const result = await recoverOwnerWithCode(db, str(body.email), str(body.code), str(body.password));
+        send(res, 200, { email: result.email });
+        return;
+      }
+
       if (method === "POST" && path === "/api/login") {
         loginLimiter.hit(clientKey(req));
         const body = await readJson(req);
@@ -343,10 +357,12 @@ export function createRequestHandler(
         await seedPlans(db);
 
         const email = String(body.email ?? "").trim().toLowerCase();
-        const planId = body.planId ? String(body.planId) : "starter";
-        if (!(await db.get("SELECT 1 AS x FROM plans WHERE plan_id = ?", [planId]))) {
-          throw new ValidationError(`Unknown plan ${planId}`);
+        // Public signups start free. A paid plan is activated only after Paystack
+        // confirms its first card charge; choosing a tier in the browser is not payment.
+        if (body.planId && String(body.planId) !== "free") {
+          throw new ValidationError("Paid plans are activated through Billing after signup");
         }
+        const planId = "free";
         // Email is unique across the workspace, so catch the clash before the insert.
         if (await db.get("SELECT 1 AS x FROM users WHERE email = ?", [email])) {
           send(res, 409, { error: "That email already has an account. Sign in instead." });
@@ -362,7 +378,11 @@ export function createRequestHandler(
           branchName: body.branchName ? String(body.branchName) : undefined,
           phone: body.phone ? String(body.phone) : null,
         });
-        send(res, 201, { token: result.token, ...(await sessionPayload(db, await authenticate(db, result.token), gateway)) });
+        send(res, 201, {
+          token: result.token,
+          recoveryCodes: result.recoveryCodes,
+          ...(await sessionPayload(db, await authenticate(db, result.token), gateway)),
+        });
         return;
       }
 
@@ -606,6 +626,61 @@ export function createRequestHandler(
         return;
       }
 
+      const staffPasswordMatch = /^\/api\/staff\/([^/]+)\/password$/.exec(path);
+      if (method === "POST" && staffPasswordMatch) {
+        const me = await actor();
+        const body = await readJson(req);
+        await resetStaffPassword(db, me, staffPasswordMatch[1], str(body.password));
+        send(res, 200, { ok: true });
+        return;
+      }
+
+      if (method === "POST" && path === "/api/recovery-codes") {
+        const me = await actor();
+        const body = await readJson(req);
+        const recoveryCodes = await regenerateRecoveryCodes(db, me, str(body.currentPassword));
+        send(res, 200, { recoveryCodes });
+        return;
+      }
+
+      /* ------------------------- subscription billing ------------------------- */
+
+      if (method === "GET" && path === "/api/billing") {
+        const me = await actor();
+        send(res, 200, await billingState(me, gateway !== null));
+        return;
+      }
+
+      if (method === "POST" && path === "/api/billing/checkout") {
+        if (!gateway) throw new ValidationError("Subscription billing is not switched on for this deployment");
+        const me = await actor();
+        const body = await readJson(req);
+        send(res, 201, { checkout: await startSubscriptionCheckout(me, gateway, str(body.planId)) });
+        return;
+      }
+
+      if (method === "POST" && path === "/api/billing/confirm") {
+        if (!gateway) throw new ValidationError("Subscription billing is not switched on for this deployment");
+        const me = await actor();
+        if (me.role !== "owner") throw new PermissionError("Only the owner can manage billing");
+        const body = await readJson(req);
+        send(res, 200, { billing: await confirmSubscriptionCheckout(db, gateway, str(body.reference)) });
+        return;
+      }
+
+      if (method === "GET" && path === "/api/billing/manage") {
+        if (!gateway) throw new ValidationError("Subscription billing is not switched on for this deployment");
+        send(res, 200, { url: await subscriptionManageLink(await actor(), gateway) });
+        return;
+      }
+
+      if (method === "POST" && path === "/api/billing/cancel") {
+        if (!gateway) throw new ValidationError("Subscription billing is not switched on for this deployment");
+        await cancelSubscription(await actor(), gateway);
+        send(res, 200, { ok: true });
+        return;
+      }
+
       if (method === "POST" && path === "/api/payments/charge") {
         if (!gateway) throw new ValidationError("Card and mobile money are not switched on for this deployment");
         const me = await actor();
@@ -667,6 +742,7 @@ export function createRequestHandler(
 }
 
 async function sessionPayload(db: Database, me: Actor, gateway: PaymentGateway | null) {
+  await enforceBillingExpiry(db, me.scope.tenantId);
   const tenant = await me.scope.tenant<{ name: string }>();
   const user = await me.scope.get<{ name: string }>(
     "SELECT name FROM users WHERE tenant_id = {{tenant}} AND user_id = ?",
@@ -688,6 +764,7 @@ async function sessionPayload(db: Database, me: Actor, gateway: PaymentGateway |
     },
     branches: await branchesFor(me),
     payments: { enabled: gateway !== null },
+    billing: { enabled: gateway !== null },
     permissions: Object.fromEntries(PERMISSIONS.map((p) => [p, can(me.role as Role, p)])),
   };
 }

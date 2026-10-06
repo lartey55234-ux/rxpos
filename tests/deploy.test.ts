@@ -30,7 +30,6 @@ const registration = {
   ownerName: "Nana Adjei",
   email: "Nana@Adenta.example",
   password: "goodpassword",
-  planId: "standard",
   branchName: "Adenta Main",
 };
 
@@ -53,7 +52,7 @@ test("a pharmacy can open its own account and lands signed in", async () => {
   const body = (await res.json()) as Record<string, never>;
   assert.ok(body.token);
   assert.equal((body.tenant as { name: string }).name, "Adenta Community Pharmacy");
-  assert.equal((body.tenant as { plan: { id: string } }).plan.id, "standard");
+  assert.equal((body.tenant as { plan: { id: string } }).plan.id, "free");
   assert.equal((body.user as { role: string }).role, "owner");
   assert.equal((body.branches as unknown[]).length, 1);
   assert.equal((body.permissions as Record<string, boolean>).assets, true);
@@ -72,7 +71,7 @@ test("a second pharmacy cannot reuse an email", async () => {
   assert.match(((await res.json()) as { error: string }).error, /already has an account/);
 });
 
-test("registration refuses a short password, a bad email and an unknown plan", async () => {
+test("registration refuses a short password, a bad email and unpaid plan selection", async () => {
   const weak = await post("/api/signup", { ...registration, email: "a@b.example", password: "short" });
   assert.equal(weak.status, 400);
   assert.match(((await weak.json()) as { error: string }).error, /8 characters/);
@@ -82,7 +81,7 @@ test("registration refuses a short password, a bad email and an unknown plan", a
 
   const badPlan = await post("/api/signup", { ...registration, email: "c@d.example", planId: "enterprise" });
   assert.equal(badPlan.status, 400);
-  assert.match(((await badPlan.json()) as { error: string }).error, /Unknown plan/);
+  assert.match(((await badPlan.json()) as { error: string }).error, /activated through Billing/);
 });
 
 test("a pharmacy that registers arrives empty, not sharing anyone's stock", async () => {

@@ -250,7 +250,6 @@ test("a deployment with no keys does not offer card or mobile money", async () =
         ownerName: "Owner",
         email: "nopay@example.com",
         password: "nopay12345",
-        planId: "starter",
       }),
     });
     const body = (await signup.json()) as { token: string; payments: { enabled: boolean } };

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { freshTestDatabase, newPharmacy } from "../src/testing.ts";
-import { AuthError, addStaff, authenticate, hashPassword, login, logout, registerPharmacy, verifyPassword } from "../src/auth.ts";
+import { AuthError, addStaff, authenticate, hashPassword, login, logout, recoverOwnerWithCode, regenerateRecoveryCodes, registerPharmacy, resetStaffPassword, verifyPassword } from "../src/auth.ts";
 import { PlanLimitError } from "../src/plans.ts";
 import { PermissionError, assertCan } from "../src/permissions.ts";
 
@@ -81,4 +81,57 @@ test("a registered pharmacy can log in with the owner email", async () => {
   const session = await login(db, "LOGIN@example.com", "secret123");
   assert.equal(session.tenantId, reg.tenantId);
   assert.equal(session.role, "owner");
+});
+
+
+test("registration creates owner recovery codes that are stored only as hashes and work once", async () => {
+  const db = await freshTestDatabase();
+  const reg = await registerPharmacy(db, {
+    pharmacyName: "Recovery Pharmacy",
+    ownerName: "Owner",
+    email: "recover@example.com",
+    password: "original123",
+    planId: "pro",
+  });
+  assert.equal(reg.recoveryCodes.length, 10);
+  assert.equal(new Set(reg.recoveryCodes).size, 10);
+  const rows = await db.all<{ code_hash: string }>("SELECT code_hash FROM owner_recovery_codes WHERE user_id = ?", [reg.userId]);
+  assert.equal(rows.length, 10);
+  assert.ok(rows.every((row) => /^[0-9a-f]{64}$/.test(row.code_hash)));
+  assert.ok(rows.every((row) => !reg.recoveryCodes.includes(row.code_hash)));
+
+  const oldSession = await login(db, "recover@example.com", "original123");
+  await recoverOwnerWithCode(db, "RECOVER@example.com", reg.recoveryCodes[0].toLowerCase(), "recovered123");
+  await assert.rejects(() => login(db, "recover@example.com", "original123"), /Invalid email or password/);
+  await assert.rejects(() => authenticate(db, oldSession.token), /revoked/);
+  assert.equal((await login(db, "recover@example.com", "recovered123")).role, "owner");
+  await assert.rejects(
+    () => recoverOwnerWithCode(db, "recover@example.com", reg.recoveryCodes[0], "another123"),
+    /not valid/,
+  );
+});
+
+test("owner can replace recovery codes only after proving the current password", async () => {
+  const f = await newPharmacy("pro", "codes");
+  await assert.rejects(() => regenerateRecoveryCodes(f.db, f.owner, "wrong"), /not correct/);
+  const codes = await regenerateRecoveryCodes(f.db, f.owner, "secret123");
+  assert.equal(codes.length, 10);
+  const rows = await f.owner.scope.all("SELECT * FROM owner_recovery_codes WHERE tenant_id = {{tenant}} AND user_id = ?", f.owner.userId);
+  assert.equal(rows.length, 10);
+});
+
+test("owner resets staff password and every old staff session is revoked", async () => {
+  const f = await newPharmacy("pro", "staffreset");
+  const staffId = await addStaff(f.db, f.owner, {
+    name: "Ama",
+    email: "ama.reset@example.com",
+    password: "oldpassword",
+    role: "salesperson",
+  });
+  const staffSession = await login(f.db, "ama.reset@example.com", "oldpassword");
+  await resetStaffPassword(f.db, f.owner, staffId, "newpassword");
+  await assert.rejects(() => login(f.db, "ama.reset@example.com", "oldpassword"), /Invalid email or password/);
+  await assert.rejects(() => authenticate(f.db, staffSession.token), /revoked/);
+  assert.equal((await login(f.db, "ama.reset@example.com", "newpassword")).role, "salesperson");
+  await assert.rejects(() => resetStaffPassword(f.db, f.owner, f.owner.userId, "newpassword"), /staff account/);
 });

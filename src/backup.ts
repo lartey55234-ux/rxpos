@@ -36,6 +36,9 @@ export const TABLES = [
   "users",
   "sessions",
   "subscriptions",
+  "billing_plan_links",
+  "billing_checkouts",
+  "subscription_billing",
   "categories",
   "products",
   "suppliers",
@@ -52,6 +55,7 @@ export const TABLES = [
   "controlled_register",
   "audit_log",
   "password_resets",
+  "owner_recovery_codes",
 ] as const;
 
 export type TableName = (typeof TABLES)[number];

@@ -43,11 +43,13 @@ test("a new pharmacy starts with nothing", async () => {
     ownerName: "Ama Owusu",
     email: "ama@setup.example",
     password: "setup12345",
-    planId: "standard",
   });
   assert.equal(res.status, 201);
   owner = res.body.token as unknown as string;
   branch = res.body.branches[0].branch_id as unknown as string;
+  // This file tests pharmacy setup, not checkout. Give its fixture the standard
+  // entitlement directly; billing activation has its own end-to-end suite.
+  await db.run("UPDATE tenants SET plan_id = 'standard' WHERE tenant_id = ?", [res.body.tenant.id]);
 
   const products = await get(`/api/products?branchId=${branch}`, owner);
   assert.deepEqual(products.body.products, []);

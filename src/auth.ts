@@ -9,6 +9,8 @@ import { assertCan, type Role } from "./permissions.ts";
 
 const KEYLEN = 64;
 const SESSION_DAYS = 30;
+const RECOVERY_CODE_COUNT = 10;
+const MIN_PASSWORD = 8;
 
 export function hashPassword(password: string, salt = randomBytes(16).toString("hex")) {
   return { hash: scryptSync(password, salt, KEYLEN).toString("hex"), salt };
@@ -51,6 +53,8 @@ export type RegisterResult = {
   userId: string;
   token: string;
   expiresAt: string;
+  /** Shown once after signup; only hashes are retained. */
+  recoveryCodes: string[];
 };
 
 /**
@@ -108,6 +112,7 @@ export async function registerPharmacy(db: Database, input: RegisterInput): Prom
     );
 
     const session = await createSession(trx, tenantId, userId);
+    const recoveryCodes = await replaceRecoveryCodes(trx, tenantId, userId);
     await writeAudit(new TenantScope(trx, tenantId), {
       userId,
       entityType: "tenant",
@@ -116,7 +121,7 @@ export async function registerPharmacy(db: Database, input: RegisterInput): Prom
       after: { pharmacyName: input.pharmacyName, planId },
     });
 
-    return { tenantId, branchId, userId, token: session.token, expiresAt: session.expiresAt };
+    return { tenantId, branchId, userId, token: session.token, expiresAt: session.expiresAt, recoveryCodes };
   });
 }
 
@@ -223,4 +228,149 @@ export async function addStaff(
     after: { name: input.name, role: input.role },
   });
   return userId;
+}
+
+function normaliseRecoveryCode(code: string): string {
+  return (code ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function recoveryCodeHash(code: string): string {
+  return createHash("sha256").update(normaliseRecoveryCode(code)).digest("hex");
+}
+
+function newRecoveryCode(): string {
+  // 80 random bits, split for transcription. Ambiguous characters are absent.
+  const alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+  const bytes = randomBytes(16);
+  let out = "";
+  for (let i = 0; i < 16; i += 1) out += alphabet[bytes[i] % alphabet.length];
+  return `RX-${out.slice(0, 4)}-${out.slice(4, 8)}-${out.slice(8, 12)}-${out.slice(12)}`;
+}
+
+async function replaceRecoveryCodes(db: Database, tenantId: string, userId: string): Promise<string[]> {
+  const scope = new TenantScope(db, tenantId);
+  await scope.run("DELETE FROM owner_recovery_codes WHERE tenant_id = {{tenant}} AND user_id = ?", userId);
+  const codes = Array.from({ length: RECOVERY_CODE_COUNT }, () => newRecoveryCode());
+  const createdAt = nowIso();
+  for (const code of codes) {
+    await scope.insert("owner_recovery_codes", {
+      recovery_code_id: newId("rcv"),
+      user_id: userId,
+      code_hash: recoveryCodeHash(code),
+      created_at: createdAt,
+      used_at: null,
+    });
+  }
+  return codes;
+}
+
+/** Owner-only: replace every recovery code after proving the current password. */
+export async function regenerateRecoveryCodes(db: Database, actor: Actor, currentPassword: string): Promise<string[]> {
+  if (actor.role !== "owner") throw new AuthError("Only the owner can manage recovery codes");
+  const owner = await actor.scope.get<{ password_hash: string; password_salt: string }>(
+    "SELECT password_hash, password_salt FROM users WHERE tenant_id = {{tenant}} AND user_id = ?",
+    actor.userId,
+  );
+  if (!owner || !verifyPassword(currentPassword, owner.password_hash, owner.password_salt)) {
+    throw new AuthError("Current password is not correct");
+  }
+  return db.transaction(async (trx) => {
+    const codes = await replaceRecoveryCodes(trx, actor.scope.tenantId, actor.userId);
+    await writeAudit(new TenantScope(trx, actor.scope.tenantId), {
+      userId: actor.userId,
+      entityType: "user",
+      entityId: actor.userId,
+      action: "recovery_codes_regenerated",
+    });
+    return codes;
+  });
+}
+
+/** Use one owner recovery code to choose a new password without relying on email. */
+export async function recoverOwnerWithCode(
+  db: Database,
+  email: string,
+  code: string,
+  newPassword: string,
+): Promise<{ email: string }> {
+  if ((newPassword ?? "").length < MIN_PASSWORD) {
+    throw new ValidationError(`Choose a password of at least ${MIN_PASSWORD} characters`);
+  }
+  const normalisedEmail = (email ?? "").trim().toLowerCase();
+  const codeHash = recoveryCodeHash(code);
+  const row = await db.get<{ recovery_code_id: string; tenant_id: string; user_id: string; email: string }>(
+    `SELECT r.recovery_code_id, r.tenant_id, r.user_id, u.email
+       FROM owner_recovery_codes r
+       JOIN users u ON u.user_id = r.user_id AND u.tenant_id = r.tenant_id
+      WHERE u.email = ? AND u.role = 'owner' AND u.status = 'active'
+        AND r.code_hash = ? AND r.used_at IS NULL`,
+    [normalisedEmail, codeHash],
+  );
+  if (!row) throw new AuthError("That recovery code is not valid");
+
+  const { hash, salt } = hashPassword(newPassword);
+  const now = nowIso();
+  await db.transaction(async (trx) => {
+    const scope = new TenantScope(trx, row.tenant_id);
+    const spent = await scope.run(
+      "UPDATE owner_recovery_codes SET used_at = ? WHERE tenant_id = {{tenant}} AND recovery_code_id = ? AND used_at IS NULL",
+      now,
+      row.recovery_code_id,
+    );
+    if (spent !== 1) throw new AuthError("That recovery code is not valid");
+    await scope.run(
+      "UPDATE users SET password_hash = ?, password_salt = ? WHERE tenant_id = {{tenant}} AND user_id = ?",
+      hash,
+      salt,
+      row.user_id,
+    );
+    await scope.run(
+      "UPDATE sessions SET revoked_at = ? WHERE tenant_id = {{tenant}} AND user_id = ? AND revoked_at IS NULL",
+      now,
+      row.user_id,
+    );
+    await writeAudit(scope, {
+      userId: row.user_id,
+      entityType: "user",
+      entityId: row.user_id,
+      action: "password_recovered_with_code",
+    });
+  });
+  return { email: row.email };
+}
+
+/** Owner-only: choose a new staff password and end every session using the old one. */
+export async function resetStaffPassword(db: Database, actor: Actor, userId: string, newPassword: string): Promise<void> {
+  assertCan(actor.role, "users");
+  if ((newPassword ?? "").length < MIN_PASSWORD) {
+    throw new ValidationError(`Choose a password of at least ${MIN_PASSWORD} characters`);
+  }
+  const target = await actor.scope.get<{ role: Role; name: string }>(
+    "SELECT role, name FROM users WHERE tenant_id = {{tenant}} AND user_id = ?",
+    userId,
+  );
+  if (!target || target.role === "owner") throw new ValidationError("Choose a staff account");
+  const { hash, salt } = hashPassword(newPassword);
+  const now = nowIso();
+  await db.transaction(async (trx) => {
+    const scope = new TenantScope(trx, actor.scope.tenantId);
+    await scope.run(
+      "UPDATE users SET password_hash = ?, password_salt = ? WHERE tenant_id = {{tenant}} AND user_id = ?",
+      hash,
+      salt,
+      userId,
+    );
+    await scope.run(
+      "UPDATE sessions SET revoked_at = ? WHERE tenant_id = {{tenant}} AND user_id = ? AND revoked_at IS NULL",
+      now,
+      userId,
+    );
+    await writeAudit(scope, {
+      userId: actor.userId,
+      entityType: "user",
+      entityId: userId,
+      action: "staff_password_reset",
+      after: { name: target.name },
+    });
+  });
 }

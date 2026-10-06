@@ -9,7 +9,7 @@ import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
 import { freshTestDatabase, seedBatch, seedProduct } from "../src/testing.ts";
 import { startServer } from "../src/server.ts";
-import { authenticate, login, registerPharmacy } from "../src/auth.ts";
+import { addStaff, authenticate, login, registerPharmacy } from "../src/auth.ts";
 import { checkResetToken, requestPasswordReset, resetPassword, RESET_MINUTES } from "../src/password.ts";
 import { RecordingMailer } from "../src/mail.ts";
 import { todayIso, addDays } from "../src/util.ts";
@@ -42,7 +42,7 @@ async function pharmacy() {
   const owner = await authenticate(db, reg.token);
   const product = await seedProduct(owner, { name: "Paracetamol", pricePesewas: 500 });
   await seedBatch(owner, reg.branchId, product, { batchNumber: "P1", expiryDate: addDays(todayIso(), 200), quantity: 10 });
-  return { email, token: reg.token, owner, branchId: reg.branchId, tenantId: reg.tenantId };
+  return { email, token: reg.token, owner, branchId: reg.branchId, tenantId: reg.tenantId, recoveryCodes: reg.recoveryCodes };
 }
 
 test("a reset link is sent, and it works once", async () => {
@@ -191,4 +191,53 @@ test("the whole thing over HTTP", async () => {
 
   const spent = await fetch(`${base}/api/password/reset?token=${encodeURIComponent(token)}`);
   assert.equal(((await spent.json()) as { valid: boolean }).valid, false, "and the link is spent");
+});
+
+
+test("the owner recovery-code path works over HTTP without email", async () => {
+  const shop = await pharmacy();
+  const recovered = await fetch(`${base}/api/password/recover`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: shop.email, code: shop.recoveryCodes[0], password: "codechanged123" }),
+  });
+  assert.equal(recovered.status, 200);
+  assert.equal((await recovered.json() as { email: string }).email, shop.email);
+  assert.equal((await login(db, shop.email, "codechanged123")).role, "owner");
+
+  const replay = await fetch(`${base}/api/password/recover`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: shop.email, code: shop.recoveryCodes[0], password: "againchanged123" }),
+  });
+  assert.equal(replay.status, 401, "a spent code cannot be replayed");
+});
+
+test("the owner resets staff over HTTP and regenerates codes after confirming the password", async () => {
+  const shop = await pharmacy();
+  const staffId = await addStaff(db, shop.owner, {
+    name: "Kofi",
+    email: `kofi.${runId}.${counter}@example.com`,
+    password: "staffold123",
+    role: "salesperson",
+  });
+  const staffEmail = `kofi.${runId}.${counter}@example.com`;
+  const staffSession = await login(db, staffEmail, "staffold123");
+
+  const reset = await fetch(`${base}/api/staff/${encodeURIComponent(staffId)}/password`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${shop.token}` },
+    body: JSON.stringify({ password: "staffnew123" }),
+  });
+  assert.equal(reset.status, 200);
+  await assert.rejects(() => authenticate(db, staffSession.token), /revoked/);
+  assert.equal((await login(db, staffEmail, "staffnew123")).role, "salesperson");
+
+  const generated = await fetch(`${base}/api/recovery-codes`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${shop.token}` },
+    body: JSON.stringify({ currentPassword: "original123" }),
+  });
+  assert.equal(generated.status, 200);
+  assert.equal(((await generated.json()) as { recoveryCodes: string[] }).recoveryCodes.length, 10);
 });
