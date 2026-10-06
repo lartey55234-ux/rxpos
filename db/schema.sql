@@ -48,22 +48,6 @@ CREATE TABLE IF NOT EXISTS billing_plan_links (
   created_at          TEXT NOT NULL
 );
 
--- A checkout is written before the owner leaves for Paystack. Confirmation is
--- idempotent, whether it arrives from the browser or a signed webhook.
-CREATE TABLE IF NOT EXISTS billing_checkouts (
-  checkout_id         TEXT PRIMARY KEY,
-  tenant_id           TEXT NOT NULL REFERENCES tenants(tenant_id),
-  user_id             TEXT NOT NULL REFERENCES users(user_id),
-  plan_id             TEXT NOT NULL REFERENCES plans(plan_id),
-  reference           TEXT NOT NULL UNIQUE,
-  provider            TEXT NOT NULL,
-  provider_plan_code  TEXT NOT NULL,
-  amount_pesewas      INTEGER NOT NULL,
-  status              TEXT NOT NULL DEFAULT 'pending',
-  created_at          TEXT NOT NULL,
-  confirmed_at        TEXT
-);
-
 -- The provider-specific state for the tenant's current recurring subscription.
 -- email_token is never returned to the browser; Paystack requires it to cancel.
 CREATE TABLE IF NOT EXISTS subscription_billing (
@@ -105,6 +89,22 @@ CREATE TABLE IF NOT EXISTS users (
   role           TEXT NOT NULL CHECK (role IN ('owner','admin','salesperson')),
   status         TEXT NOT NULL DEFAULT 'active',
   created_at     TEXT NOT NULL
+);
+
+-- A checkout is written before the owner leaves for Paystack. Confirmation is
+-- idempotent, whether it arrives from the browser or a signed webhook.
+CREATE TABLE IF NOT EXISTS billing_checkouts (
+  checkout_id         TEXT PRIMARY KEY,
+  tenant_id           TEXT NOT NULL REFERENCES tenants(tenant_id),
+  user_id             TEXT NOT NULL REFERENCES users(user_id),
+  plan_id             TEXT NOT NULL REFERENCES plans(plan_id),
+  reference           TEXT NOT NULL UNIQUE,
+  provider            TEXT NOT NULL,
+  provider_plan_code  TEXT NOT NULL,
+  amount_pesewas      INTEGER NOT NULL,
+  status              TEXT NOT NULL DEFAULT 'pending',
+  created_at          TEXT NOT NULL,
+  confirmed_at        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
