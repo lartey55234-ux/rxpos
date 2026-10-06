@@ -270,7 +270,7 @@ export class FakeGateway implements PaymentGateway {
   }
 
   async createSubscriptionPlan(input: { name: string; amountPesewas: number; interval: "monthly" }): Promise<SubscriptionPlan> {
-    const planCode = `PLN_fake_${this.subscriptionPlans.length + 1}`;
+    const planCode = `PLN_fake_${randomBytes(6).toString("hex")}`;
     this.subscriptionPlans.push({ name: input.name, amountPesewas: input.amountPesewas, planCode });
     return { planCode };
   }

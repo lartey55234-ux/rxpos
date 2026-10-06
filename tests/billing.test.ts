@@ -91,7 +91,9 @@ test("subscription.create attaches provider controls, then manage and cancel wor
   const checkout = await startSubscriptionCheckout(f.owner, f.gateway, "starter");
   f.gateway.succeed(checkout.reference, 6000, "card");
   await confirmSubscriptionCheckout(f.db, f.gateway, checkout.reference);
-  const planCode = f.gateway.subscriptionPlans[0].planCode;
+  const planCode = (await f.db.get<{ provider_plan_code: string }>(
+    "SELECT provider_plan_code FROM billing_plan_links WHERE plan_id = 'starter'",
+  ))!.provider_plan_code;
 
   assert.equal(
     await handleSubscriptionWebhook(f.db, f.gateway, {
