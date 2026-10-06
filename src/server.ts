@@ -33,6 +33,7 @@ import { clearErrors, errorSummary, listErrors, recordError } from "./errors.ts"
 import { PaystackGateway, verifyWebhookSignature, type Channel, type PaymentGateway } from "./payments.ts";
 import { ValidationError } from "./util.ts";
 import type { Actor } from "./actor.ts";
+import { billingState, cancelSubscription, confirmSubscriptionCheckout, enforceBillingExpiry, handleSubscriptionWebhook, startSubscriptionCheckout, subscriptionManageLink } from "./billing.ts";
 
 const here = fileURLToPath(new URL("..", import.meta.url));
 const MIME: Record<string, string> = {
@@ -232,12 +233,17 @@ export function createRequestHandler(
         } catch {
           throw new ValidationError("Webhook body is not valid JSON");
         }
-        if (event.event === "charge.success" && event.data?.reference && gateway) {
+        if (gateway) {
           try {
-            await confirmCharge(db, gateway, event.data.reference);
+            const reference = String(event.data?.reference ?? "");
+            if (event.event === "charge.success" && reference) {
+              const saleIntent = await db.get("SELECT 1 AS x FROM payment_intents WHERE reference = ?", [reference]);
+              if (saleIntent) await confirmCharge(db, gateway, reference);
+            }
+            await handleSubscriptionWebhook(db, gateway, event as { event?: string; data?: Record<string, unknown> });
           } catch (err) {
             // Answer 200 anyway: Paystack retries, and a mismatch needs a human.
-            console.error("[rxpos] webhook charge.success:", err);
+            console.error(`[rxpos] webhook ${event.event ?? "unknown"}:`, err);
           }
         }
         send(res, 200, { received: true });
@@ -351,10 +357,12 @@ export function createRequestHandler(
         await seedPlans(db);
 
         const email = String(body.email ?? "").trim().toLowerCase();
-        const planId = body.planId ? String(body.planId) : "starter";
-        if (!(await db.get("SELECT 1 AS x FROM plans WHERE plan_id = ?", [planId]))) {
-          throw new ValidationError(`Unknown plan ${planId}`);
+        // Public signups start free. A paid plan is activated only after Paystack
+        // confirms its first card charge; choosing a tier in the browser is not payment.
+        if (body.planId && String(body.planId) !== "free") {
+          throw new ValidationError("Paid plans are activated through Billing after signup");
         }
+        const planId = "free";
         // Email is unique across the workspace, so catch the clash before the insert.
         if (await db.get("SELECT 1 AS x FROM users WHERE email = ?", [email])) {
           send(res, 409, { error: "That email already has an account. Sign in instead." });
@@ -635,6 +643,44 @@ export function createRequestHandler(
         return;
       }
 
+      /* ------------------------- subscription billing ------------------------- */
+
+      if (method === "GET" && path === "/api/billing") {
+        const me = await actor();
+        send(res, 200, await billingState(me, gateway !== null));
+        return;
+      }
+
+      if (method === "POST" && path === "/api/billing/checkout") {
+        if (!gateway) throw new ValidationError("Subscription billing is not switched on for this deployment");
+        const me = await actor();
+        const body = await readJson(req);
+        send(res, 201, { checkout: await startSubscriptionCheckout(me, gateway, str(body.planId)) });
+        return;
+      }
+
+      if (method === "POST" && path === "/api/billing/confirm") {
+        if (!gateway) throw new ValidationError("Subscription billing is not switched on for this deployment");
+        const me = await actor();
+        if (me.role !== "owner") throw new PermissionError("Only the owner can manage billing");
+        const body = await readJson(req);
+        send(res, 200, { billing: await confirmSubscriptionCheckout(db, gateway, str(body.reference)) });
+        return;
+      }
+
+      if (method === "GET" && path === "/api/billing/manage") {
+        if (!gateway) throw new ValidationError("Subscription billing is not switched on for this deployment");
+        send(res, 200, { url: await subscriptionManageLink(await actor(), gateway) });
+        return;
+      }
+
+      if (method === "POST" && path === "/api/billing/cancel") {
+        if (!gateway) throw new ValidationError("Subscription billing is not switched on for this deployment");
+        await cancelSubscription(await actor(), gateway);
+        send(res, 200, { ok: true });
+        return;
+      }
+
       if (method === "POST" && path === "/api/payments/charge") {
         if (!gateway) throw new ValidationError("Card and mobile money are not switched on for this deployment");
         const me = await actor();
@@ -696,6 +742,7 @@ export function createRequestHandler(
 }
 
 async function sessionPayload(db: Database, me: Actor, gateway: PaymentGateway | null) {
+  await enforceBillingExpiry(db, me.scope.tenantId);
   const tenant = await me.scope.tenant<{ name: string }>();
   const user = await me.scope.get<{ name: string }>(
     "SELECT name FROM users WHERE tenant_id = {{tenant}} AND user_id = ?",
@@ -717,6 +764,7 @@ async function sessionPayload(db: Database, me: Actor, gateway: PaymentGateway |
     },
     branches: await branchesFor(me),
     payments: { enabled: gateway !== null },
+    billing: { enabled: gateway !== null },
     permissions: Object.fromEntries(PERMISSIONS.map((p) => [p, can(me.role as Role, p)])),
   };
 }

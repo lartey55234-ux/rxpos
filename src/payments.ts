@@ -33,7 +33,10 @@ export type VerifiedTransaction = {
   amountPesewas: number;
   channel: string | null;
   currency: string;
+  customerCode?: string | null;
 };
+
+export type SubscriptionPlan = { planCode: string };
 
 export interface PaymentGateway {
   readonly name: string;
@@ -44,6 +47,15 @@ export interface PaymentGateway {
     channels: Channel[];
   }): Promise<InitialisedTransaction>;
   verify(reference: string): Promise<VerifiedTransaction>;
+  createSubscriptionPlan(input: { name: string; amountPesewas: number; interval: "monthly" }): Promise<SubscriptionPlan>;
+  initializeSubscription(input: {
+    email: string;
+    planCode: string;
+    reference: string;
+    metadata: Record<string, string>;
+  }): Promise<InitialisedTransaction>;
+  manageSubscription(subscriptionCode: string): Promise<string>;
+  disableSubscription(subscriptionCode: string, emailToken: string): Promise<void>;
 }
 
 export class PaymentError extends Error {
@@ -66,7 +78,7 @@ export class PaystackGateway implements PaymentGateway {
     this.secretKey = secretKey;
   }
 
-  private async call<T>(path: string, init: RequestInit = {}): Promise<T> {
+  private async call<T>(path: string, init: RequestInit = {}, requireData = true): Promise<T> {
     let response: Response;
     try {
       response = await fetch(`https://api.paystack.co${path}`, {
@@ -85,8 +97,8 @@ export class PaystackGateway implements PaymentGateway {
     if (!response.ok || body.status === false) {
       throw new PaymentError(body.message ?? `Paystack refused the request (${response.status})`);
     }
-    if (body.data === undefined) throw new PaymentError("Paystack returned no data");
-    return body.data;
+    if (body.data === undefined && requireData) throw new PaymentError("Paystack returned no data");
+    return body.data as T;
   }
 
   async initialize(input: {
@@ -118,6 +130,7 @@ export class PaystackGateway implements PaymentGateway {
       amount: number;
       channel: string | null;
       currency: string;
+      customer?: { customer_code?: string };
     }>(`/transaction/verify/${encodeURIComponent(reference)}`);
 
     return {
@@ -126,7 +139,62 @@ export class PaystackGateway implements PaymentGateway {
       amountPesewas: Number(data.amount),
       channel: data.channel ?? null,
       currency: data.currency,
+      customerCode: data.customer?.customer_code ?? null,
     };
+  }
+
+  async createSubscriptionPlan(input: { name: string; amountPesewas: number; interval: "monthly" }): Promise<SubscriptionPlan> {
+    const data = await this.call<{ plan_code: string }>("/plan", {
+      method: "POST",
+      body: JSON.stringify({
+        name: input.name,
+        amount: input.amountPesewas,
+        interval: input.interval,
+        currency: "GHS",
+        send_invoices: true,
+      }),
+    });
+    return { planCode: data.plan_code };
+  }
+
+  async initializeSubscription(input: {
+    email: string;
+    planCode: string;
+    reference: string;
+    metadata: Record<string, string>;
+  }): Promise<InitialisedTransaction> {
+    const data = await this.call<{ reference: string; access_code: string; authorization_url: string }>(
+      "/transaction/initialize",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          email: input.email,
+          reference: input.reference,
+          plan: input.planCode,
+          channels: ["card"],
+          metadata: JSON.stringify(input.metadata),
+        }),
+      },
+    );
+    return { reference: data.reference, accessCode: data.access_code, authorizationUrl: data.authorization_url };
+  }
+
+  async manageSubscription(subscriptionCode: string): Promise<string> {
+    const data = await this.call<{ link: string }>(
+      `/subscription/${encodeURIComponent(subscriptionCode)}/manage/link`,
+    );
+    return data.link;
+  }
+
+  async disableSubscription(subscriptionCode: string, emailToken: string): Promise<void> {
+    await this.call<unknown>(
+      "/subscription/disable",
+      {
+        method: "POST",
+        body: JSON.stringify({ code: subscriptionCode, token: emailToken }),
+      },
+      false,
+    );
   }
 }
 
@@ -146,6 +214,9 @@ export class FakeGateway implements PaymentGateway {
   private readonly transactions = new Map<string, VerifiedTransaction>();
   /** What initialize was called with, so tests can assert on it. */
   readonly initialised: { email: string; amountPesewas: number; reference: string }[] = [];
+  readonly subscriptionPlans: { name: string; amountPesewas: number; planCode: string }[] = [];
+  readonly initialisedSubscriptions: { email: string; planCode: string; reference: string; metadata: Record<string, string> }[] = [];
+  readonly disabledSubscriptions: string[] = [];
 
   /** Pretend the customer paid. */
   succeed(reference: string, amountPesewas: number, channel = "card"): void {
@@ -196,5 +267,33 @@ export class FakeGateway implements PaymentGateway {
         currency: "GHS",
       }
     );
+  }
+
+  async createSubscriptionPlan(input: { name: string; amountPesewas: number; interval: "monthly" }): Promise<SubscriptionPlan> {
+    const planCode = `PLN_fake_${this.subscriptionPlans.length + 1}`;
+    this.subscriptionPlans.push({ name: input.name, amountPesewas: input.amountPesewas, planCode });
+    return { planCode };
+  }
+
+  async initializeSubscription(input: {
+    email: string;
+    planCode: string;
+    reference: string;
+    metadata: Record<string, string>;
+  }): Promise<InitialisedTransaction> {
+    this.initialisedSubscriptions.push(input);
+    return {
+      reference: input.reference,
+      accessCode: `fake_${input.reference}`,
+      authorizationUrl: `https://example.invalid/subscribe/${input.reference}`,
+    };
+  }
+
+  async manageSubscription(subscriptionCode: string): Promise<string> {
+    return `https://example.invalid/manage/${encodeURIComponent(subscriptionCode)}`;
+  }
+
+  async disableSubscription(subscriptionCode: string, _emailToken: string): Promise<void> {
+    this.disabledSubscriptions.push(subscriptionCode);
   }
 }
