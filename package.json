@@ -16,7 +16,8 @@
     "demo": "npm run build && node --disable-warning=ExperimentalWarning scripts/demo.ts",
     "start": "node --disable-warning=ExperimentalWarning scripts/serve.ts",
     "backup": "node --disable-warning=ExperimentalWarning scripts/backup.ts",
-    "restore": "node --disable-warning=ExperimentalWarning scripts/restore.ts"
+    "restore": "node --disable-warning=ExperimentalWarning scripts/restore.ts",
+    "mail-test": "node --disable-warning=ExperimentalWarning scripts/mail-test.ts"
   },
   "devDependencies": {
     "@types/pg": "^8.23.1",
