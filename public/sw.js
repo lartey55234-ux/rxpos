@@ -11,7 +11,7 @@
  * that has gone quiet, the cached copy is served after a short wait.
  */
 
-const CACHE = "rxpos-shell-v1";
+const CACHE = "rxpos-shell-v2";
 const SHELL = ["/", "/index.html", "/styles.css", "/app.js"];
 const NETWORK_PATIENCE_MS = 3000;
 

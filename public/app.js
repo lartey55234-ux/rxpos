@@ -232,24 +232,36 @@ function branchName() {
 }
 function renderApp() {
   if (!session) return;
-  const tabs = [
+  const primaryTabs = [
     { id: "counter", label: "Counter" },
     { id: "stock", label: "Stock" },
+    { id: "receipts", label: "Receipts" }
+  ];
+  const moreTabs = [
     ...session.permissions.products ? [{ id: "products", label: "Products" }] : [],
     ...session.permissions.suppliers ? [{ id: "suppliers", label: "Suppliers" }] : [],
     ...session.permissions.users ? [{ id: "team", label: "Team" }] : [],
-    ...session.permissions.diagnostics ? [{ id: "faults", label: "What broke" }] : [],
     { id: "alerts", label: "Alerts" },
     ...session.permissions.reports ? [{ id: "register", label: "Register" }] : [],
-    ...session.permissions.reports ? [{ id: "reports", label: "Reports" }] : []
+    ...session.permissions.reports ? [{ id: "reports", label: "Reports" }] : [],
+    ...session.permissions.diagnostics ? [{ id: "faults", label: "System issues" }] : []
   ];
+  const moreActive = moreTabs.some((t) => t.id === view);
   byId("app").innerHTML = `<div class="app">
     <header class="topbar">
       <div class="brand"><span class="mark">Rx</span><div>
         <b>${esc(session.tenant.name)}</b>
         <span>${esc(session.tenant.plan.name)} plan \xB7 ${esc(session.user.name)} \xB7 ${esc(session.user.role)}</span>
       </div></div>
-      <nav class="tabs">${tabs.map((t) => `<button data-tab="${t.id}" class="${view === t.id ? "on" : ""}">${t.label}</button>`).join("")}</nav>
+      <nav class="tabs">
+        ${primaryTabs.map((t) => `<button data-tab="${t.id}" class="${view === t.id ? "on" : ""}">${t.label}</button>`).join("")}
+        ${moreTabs.length ? `<span class="more-nav">
+          <button id="moreNav" class="${moreActive ? "on" : ""}" aria-expanded="false">More \u25BE</button>
+          <span class="more-menu" id="moreMenu">
+            ${moreTabs.map((t) => `<button data-tab="${t.id}" class="${view === t.id ? "on" : ""}">${t.label}</button>`).join("")}
+          </span>
+        </span>` : ""}
+      </nav>
       <div class="ctx">
         <label>Branch <select id="branchSel">${session.branches.map((b) => `<option value="${b.branch_id}"${b.branch_id === branchId ? " selected" : ""}>${esc(b.name)}</option>`).join("")}</select></label>
         <button class="btn sm danger" id="faults" style="display:none"></button>
@@ -277,11 +289,26 @@ function renderApp() {
     prescriptionId = null;
     renderApp();
   });
+  const moreNav = document.getElementById("moreNav");
+  const moreMenu = document.getElementById("moreMenu");
+  if (moreNav && moreMenu) {
+    moreNav.addEventListener("click", (event) => {
+      event.stopPropagation();
+      moreMenu.classList.toggle("open");
+      moreNav.setAttribute("aria-expanded", moreMenu.classList.contains("open") ? "true" : "false");
+    });
+  }
   byId("app").addEventListener("click", (event) => {
-    const tab = event.target.closest("[data-tab]");
-    if (!tab) return;
-    view = tab.getAttribute("data-tab") ?? "counter";
-    renderApp();
+    const target = event.target;
+    const tab = target.closest("[data-tab]");
+    if (tab) {
+      view = tab.getAttribute("data-tab") ?? "counter";
+      renderApp();
+      return;
+    }
+    if (!target.closest(".more-nav")) {
+      moreMenu?.classList.remove("open");
+    }
   });
   renderView();
   noteFreshness(offlineSince);
@@ -292,6 +319,7 @@ function renderView() {
   else if (view === "products") void renderProducts();
   else if (view === "suppliers") void renderSuppliers();
   else if (view === "team") void renderTeam();
+  else if (view === "receipts") void renderReceipts();
   else if (view === "faults") void renderFaults();
   else if (view === "alerts") renderAlerts();
   else if (view === "register") renderRegister();
@@ -674,6 +702,57 @@ function showReceipt(receipt) {
     window.print();
   });
 }
+async function renderReceipts() {
+  byId("main").innerHTML = `<section class="card">
+    <h2>Receipts <span class="badge b-mute">${esc(branchName())}</span></h2>
+    <div class="scanrow">
+      <input id="receiptSearch" placeholder="Search receipt number or cashier" autocomplete="off">
+    </div>
+    <div id="receiptTable"><div class="empty">Loading\u2026</div></div>
+  </section>`;
+  const search = byId("receiptSearch");
+  search.addEventListener("input", debounce(() => void loadReceipts(search.value), 180));
+  await loadReceipts("");
+}
+async function loadReceipts(query2) {
+  const box = document.getElementById("receiptTable");
+  if (!box) return;
+  try {
+    const data = await api(
+      `/api/sales?branchId=${encodeURIComponent(branchId)}&q=${encodeURIComponent(query2)}&limit=100`
+    );
+    if (!data.sales.length) {
+      box.innerHTML = `<div class="empty">${query2 ? `No receipts match "${esc(query2)}".` : "No completed sales yet."}</div>`;
+      return;
+    }
+    box.innerHTML = `<table><thead><tr><th>Receipt</th><th>Date</th><th>Cashier</th><th>Payment</th><th class="num">Items</th><th class="num">Total</th><th></th></tr></thead><tbody>
+      ${data.sales.map((sale) => {
+      const at = sale.at.replace("T", " ").slice(0, 16);
+      return `<tr>
+          <td><b>${esc(sale.saleId.slice(-8).toUpperCase())}</b></td>
+          <td>${esc(at)}</td>
+          <td>${esc(sale.servedBy)}</td>
+          <td>${esc(sale.paymentMethod)}</td>
+          <td class="num">${sale.itemCount}</td>
+          <td class="num"><b>${money(sale.totalPesewas)}</b></td>
+          <td class="num"><button class="btn sm ghost" data-receipt="${esc(sale.saleId)}">View / print</button></td>
+        </tr>`;
+    }).join("")}
+    </tbody></table>`;
+    box.querySelectorAll("[data-receipt]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          const sale = await api(`/api/sales/${encodeURIComponent(btn.getAttribute("data-receipt") ?? "")}/receipt`);
+          showReceipt(sale.receipt);
+        } catch (err) {
+          toast(err instanceof Error ? err.message : "Could not load receipt", true);
+        }
+      });
+    });
+  } catch (err) {
+    box.innerHTML = `<div class="empty">${esc(err instanceof Error ? err.message : "Could not load receipts")}</div>`;
+  }
+}
 async function renderStock() {
   byId("main").innerHTML = `<section class="card">
     <h2>Stock <span class="badge b-mute">${esc(branchName())}</span></h2>
@@ -708,14 +787,14 @@ async function loadStock(filter) {
             <td class="num">${p.on_hand}${p.on_hand !== p.sellable ? `<br><span style="font-size:11px;color:var(--muted)">+${p.on_hand - p.sellable} expired</span>` : ""}</td>
             <td>${p.nearest_expiry ? esc(p.nearest_expiry) : `<span class="badge b-mute">non-perishable</span>`}</td>
             <td class="num">${money(p.price_pesewas)}</td>
-            <td class="num">${session?.permissions.stock ? `<button class="btn sm ghost" data-receive="${p.product_id}" data-name="${esc(p.name)}">Receive</button>` : ""}</td>
+            <td class="num">${session?.permissions.stock ? `<button class="btn sm ghost" data-receive="${p.product_id}" data-name="${esc(p.name)}" data-perishable="${p.perishable === 0 || p.perishable === false ? "0" : "1"}">Receive</button>` : ""}</td>
           </tr>`;
     }).join("")}
     </tbody></table>`;
     box.querySelectorAll("[data-receive]").forEach(
       (btn) => btn.addEventListener(
         "click",
-        () => void receiveModal(btn.getAttribute("data-receive") ?? "", btn.getAttribute("data-name") ?? "")
+        () => void receiveModal(btn.getAttribute("data-receive") ?? "", btn.getAttribute("data-name") ?? "", btn.getAttribute("data-perishable") !== "0")
       )
     );
   } catch (err) {
@@ -1269,14 +1348,14 @@ async function loadCatalogue(filter) {
             ${showCost ? `<td class="num">${p.cost_price_pesewas ? money(p.cost_price_pesewas) : "\u2014"}</td>` : ""}
             <td class="num">${p.on_hand}</td>
             <td class="num">${p.reorder_level || "\u2014"}</td>
-            <td class="num"><button class="btn sm ghost" data-receive="${p.product_id}" data-name="${esc(p.name)}">Receive stock</button></td>
+            <td class="num"><button class="btn sm ghost" data-receive="${p.product_id}" data-name="${esc(p.name)}" data-perishable="${p.perishable === 0 || p.perishable === false ? "0" : "1"}">Receive stock</button></td>
           </tr>`;
     }).join("")}
     </tbody></table>`;
     box.querySelectorAll("[data-receive]").forEach(
       (btn) => btn.addEventListener(
         "click",
-        () => void receiveModal(btn.getAttribute("data-receive") ?? "", btn.getAttribute("data-name") ?? "")
+        () => void receiveModal(btn.getAttribute("data-receive") ?? "", btn.getAttribute("data-name") ?? "", btn.getAttribute("data-perishable") !== "0")
       )
     );
   } catch (err) {
@@ -1326,24 +1405,31 @@ async function productModal() {
           body: JSON.stringify({ name: typed })
         })).categoryId;
       }
-      await api("/api/products", {
-        method: "POST",
-        body: JSON.stringify({
-          name,
-          brand: byId("pBrand").value,
-          form: byId("pForm").value,
-          strength: byId("pStrength").value,
-          unit: byId("pUnit").value,
-          barcode: byId("pBarcode").value,
-          categoryId,
-          pricePesewas: toPesewas(byId("pPrice").value),
-          costPricePesewas: toPesewas(byId("pCost").value),
-          reorderLevel: Number(byId("pReorder").value || 0),
-          prescriptionRequired: byId("pRx").checked,
-          controlledClass: byId("pControlled").value,
-          perishable: byId("pPerishable").checked
-        })
-      });
+      const payload = {
+        name,
+        brand: byId("pBrand").value,
+        form: byId("pForm").value,
+        strength: byId("pStrength").value,
+        unit: byId("pUnit").value,
+        barcode: byId("pBarcode").value,
+        categoryId,
+        pricePesewas: toPesewas(byId("pPrice").value),
+        costPricePesewas: toPesewas(byId("pCost").value),
+        reorderLevel: Number(byId("pReorder").value || 0),
+        prescriptionRequired: byId("pRx").checked,
+        controlledClass: byId("pControlled").value,
+        perishable: byId("pPerishable").checked
+      };
+      try {
+        await api("/api/products", { method: "POST", body: JSON.stringify(payload) });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "";
+        if (!/looks very similar/.test(message)) throw err;
+        if (!window.confirm(`${message}
+
+Is this really a DIFFERENT medicine? Press OK to add it anyway, or Cancel to go back.`)) return;
+        await api("/api/products", { method: "POST", body: JSON.stringify({ ...payload, allowSimilar: true }) });
+      }
       closeModal();
       toast(`${name} added`);
       await loadCatalogue(document.getElementById("productSearch")?.value ?? "");
@@ -1352,39 +1438,45 @@ async function productModal() {
     }
   });
 }
-async function receiveModal(productId, productName) {
+async function receiveModal(productId, productName, perishable = true) {
   if (!productId) return;
-  let suppliers = [];
-  try {
-    suppliers = (await api("/api/suppliers")).suppliers;
-  } catch {
-  }
   openModal(`<h2>Receive stock</h2>
-    <p style="color:var(--muted);font-size:13px;margin:-6px 0 14px">${esc(productName)} into ${esc(branchName())}.</p>
-    <div class="inline">
-      ${fld("Batch number", `<input id="bNumber" placeholder="PCM-26A">`)}
-      ${fld("Expiry date", `<input id="bExpiry" type="date">`)}
-      ${fld("Quantity", `<input id="bQty" type="number" min="1" placeholder="240">`)}
-      ${fld("Supplier", `<select id="bSupplier"><option value="">\u2014 none \u2014</option>${suppliers.map((s) => `<option value="${s.supplier_id}">${esc(s.name)}</option>`).join("")}</select>`)}
-      ${fld("Cost price (GHS)", `<input id="bCost" type="number" step="0.01" min="0" placeholder="leave blank to use the product's">`)}
-      ${fld("Selling price (GHS)", `<input id="bPrice" type="number" step="0.01" min="0" placeholder="leave blank to use the product's">`)}
+    <p class="receive-product"><b>${esc(productName)}</b><span>${esc(branchName())}</span></p>
+    <div class="quick-stock">
+      <div class="fld"><label>New stock quantity</label><input id="bQty" type="number" min="1" inputmode="numeric" placeholder="20" autofocus></div>
+      <div class="fld"><label>Expiry date${perishable ? " (required)" : " (optional)"}</label><input id="bExpiry" type="date"></div>
     </div>
+    <details class="advanced-stock">
+      <summary>Batch & supplier details (optional)</summary>
+      <div class="inline" style="margin-top:12px">
+        ${fld("Batch number", `<input id="bNumber" placeholder="Leave blank to auto-generate">`)}
+        ${fld("Cost price (GHS)", `<input id="bCost" type="number" step="0.01" min="0" placeholder="Optional">`)}
+        ${fld("Selling price (GHS)", `<input id="bPrice" type="number" step="0.01" min="0" placeholder="Use current price">`)}
+      </div>
+    </details>
+    <div class="note">Enter the quantity you just received. Batch details can be added when you need them.</div>
     <div class="foot">
       <button class="btn ghost" id="cancel">Cancel</button>
-      <button class="btn primary" id="save">Receive stock</button>
+      <button class="btn primary" id="save">Add ${esc(productName)} stock</button>
     </div>`);
   byId("cancel").addEventListener("click", closeModal);
+  const qtyInput = byId("bQty");
+  qtyInput.focus();
   byId("save").addEventListener("click", async () => {
-    const quantity = Number(byId("bQty").value || 0);
-    const batchNumber = byId("bNumber").value.trim();
-    if (!batchNumber) {
-      toast("Give the batch a number", true);
-      return;
-    }
+    const quantity = Number(qtyInput.value || 0);
     if (quantity <= 0) {
-      toast("Quantity must be more than zero", true);
+      toast("Enter the number of units received", true);
+      qtyInput.focus();
       return;
     }
+    if (perishable && !byId("bExpiry").value) {
+      toast(`Enter the expiry date for ${productName}`, true);
+      byId("bExpiry").focus();
+      return;
+    }
+    const batchNumberInput = byId("bNumber");
+    const batchNumber = batchNumberInput.value.trim() || `AUTO-${(/* @__PURE__ */ new Date()).toISOString().replace(/\D/g, "").slice(0, 14)}`;
+    const expiry = byId("bExpiry").value || null;
     const cost = byId("bCost").value;
     const price = byId("bPrice").value;
     try {
@@ -1394,15 +1486,14 @@ async function receiveModal(productId, productName) {
           branchId,
           productId,
           batchNumber,
-          expiryDate: byId("bExpiry").value || null,
+          expiryDate: expiry,
           quantity,
-          supplierId: byId("bSupplier").value || null,
           ...cost ? { costPricePesewas: toPesewas(cost) } : {},
           ...price ? { sellingPricePesewas: toPesewas(price) } : {}
         })
       });
       closeModal();
-      toast(`${quantity} received`);
+      toast(`${quantity} ${productName} added to stock`);
       if (view === "products") await loadCatalogue(document.getElementById("productSearch")?.value ?? "");
       else if (view === "stock") await loadStock(document.getElementById("stockSearch")?.value ?? "");
     } catch (err) {
